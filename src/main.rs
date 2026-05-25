@@ -483,21 +483,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (id, master) in beacon_records {
         let stable_id = master.stable_identifier.clone();
+        // BeaconNamingRecord.associated_beacon and KeyAlignmentRecord.beacon_identifier
+        // both hold the master's CloudKit record UUID (i.e. `id`), not its
+        // `stable_identifier`. Looking up by stable_identifier silently misses every
+        // match, causing all accessories to fall through to the "Unknown-…" fallback
+        // and — because multiple AirTags share the same `2006~#…` prefix — collide
+        // onto the same output filename, overwriting each other's keys.
         let naming = naming_records
-            .remove(&stable_id)
+            .remove(&id)
             .unwrap_or_else(|| {
                 (
                     String::new(),
                     BeaconNamingRecord {
                         emoji: "".to_string(),
-                        name: format!("Unknown-{}", &stable_id[..8.min(stable_id.len())]),
-                        associated_beacon: stable_id.clone(),
+                        name: format!("Unknown-{}", stable_id),
+                        associated_beacon: id.clone(),
                         role_id: 0,
                     },
                 )
             });
         let alignment = alignment_records
-            .remove(&stable_id)
+            .remove(&id)
             .map(|(id, rec)| (id, rec))
             .unwrap_or_default();
         accessories.insert(
