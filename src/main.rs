@@ -3,6 +3,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore}};
@@ -164,9 +165,20 @@ fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
         plist::Value::String(acc.master_record.model.clone()),
     );
     if let Some(pairing_date) = acc.master_record.pairing_date {
+        // Apple's plistlib (and CFPropertyList) parses <date> with a strict regex
+        // that rejects fractional seconds. SystemTime here carries nanosecond
+        // precision from CloudKit and the plist crate serialises it verbatim
+        // (e.g. `2026-01-11T19:57:42.920991898Z`), making the resulting plist
+        // unreadable by `plutil`, FindMy.py, and any other tool using Apple's
+        // parser. Truncate to whole seconds.
+        let secs = pairing_date
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let truncated = UNIX_EPOCH + Duration::from_secs(secs);
         dict.insert(
             "pairingDate".to_string(),
-            plist::Value::Date(pairing_date.into()),
+            plist::Value::Date(truncated.into()),
         );
     }
     dict.insert(
