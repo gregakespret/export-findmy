@@ -498,9 +498,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // BeaconNamingRecord.associated_beacon and KeyAlignmentRecord.beacon_identifier
         // both hold the master's CloudKit record UUID (i.e. `id`), not its
         // `stable_identifier`. Looking up by stable_identifier silently misses every
-        // match, causing all accessories to fall through to the "Unknown-…" fallback
-        // and — because multiple AirTags share the same `2006~#…` prefix — collide
-        // onto the same output filename, overwriting each other's keys.
+        // match, causing all accessories to fall through to the "Unknown-…" fallback.
+        // All AirTags share the `2006~#<hwid>~#<serial>` stable-identifier scheme
+        // (Apple's product format — see findmy.py's accessory.py), so the fallback
+        // collapses every AirTag onto the same `Unknown-2006__00.plist` filename,
+        // overwriting each other's keys.
         let naming = naming_records
             .remove(&id)
             .unwrap_or_else(|| {
