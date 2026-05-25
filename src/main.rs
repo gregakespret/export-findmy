@@ -19,7 +19,7 @@ use rustpush::cloudkit::{
 use rustpush::cloudkit_proto::CloudKitRecord;
 use rustpush::findmy::{
     BeaconAccessory, BeaconNamingRecord, BeaconRatchet,
-    KeyAlignmentRecord, MasterBeaconRecord,
+    KeyAlignmentRecord, MasterBeaconRecord, SharedBeaconRecord,
     SEARCH_PARTY_CONTAINER, FIND_MY_SERVICE,
 };
 use rustpush::keychain::{KeychainClient, KeychainClientState};
@@ -238,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut apple_id = String::new();
     let mut anisette_url = "https://ani.sidestore.io".to_string();
     let mut output_dir = PathBuf::from(".");
+    let mut debug = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -254,6 +255,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 output_dir = PathBuf::from(&args[i]);
             }
+            "--debug" => {
+                debug = true;
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: export_findmy [OPTIONS]");
                 eprintln!();
@@ -261,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  --apple-id <email>       Apple ID email");
                 eprintln!("  --anisette-url <url>     Anisette server URL (default: https://ani.sidestore.io)");
                 eprintln!("  --output-dir <dir>       Output directory for plist files (default: .)");
+                eprintln!("  --debug                  Print CloudKit record-type breakdown and per-record details");
                 eprintln!();
                 eprintln!("WARNING: Output plist files contain private key material.");
                 return Ok(());
@@ -441,6 +446,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (_, changes, _) = result?.remove(0);
 
+    if debug {
+        eprintln!("  [debug] total CloudKit changes returned: {}", changes.len());
+        let mut type_counts: HashMap<String, usize> = HashMap::new();
+        for change in &changes {
+            if let Some(record) = &change.record {
+                if let Some(t) = record.r#type.as_ref() {
+                    *type_counts.entry(t.name().to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        eprintln!("  [debug] record type breakdown:");
+        let mut sorted: Vec<_> = type_counts.iter().collect();
+        sorted.sort();
+        for (t, n) in &sorted {
+            eprintln!("  [debug]   {} = {}", t, n);
+        }
+    }
+
     for change in changes {
         let identifier = change
             .identifier
@@ -458,11 +481,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pcs = pcs_keys_for_record(&record, &key)?;
             let item =
                 MasterBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs));
+            if debug {
+                eprintln!(
+                    "  [debug] Master id={} model={:?} stable={}",
+                    identifier, item.model, item.stable_identifier,
+                );
+            }
             beacon_records.insert(identifier, item);
         } else if record_type == BeaconNamingRecord::record_type() {
             let pcs = pcs_keys_for_record(&record, &key)?;
             let item =
                 BeaconNamingRecord::from_record_encrypted(&record.record_field, Some(&pcs));
+            if debug {
+                eprintln!(
+                    "  [debug] Naming id={} name={:?} assoc={}",
+                    identifier, item.name, item.associated_beacon,
+                );
+            }
             naming_records.insert(
                 item.associated_beacon.clone(),
                 (identifier, item),
@@ -475,6 +510,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 item.beacon_identifier.clone(),
                 (identifier, item),
             );
+        } else if debug && record_type == SharedBeaconRecord::record_type() {
+            // Shared beacons are not used by export-findmy (no private keys), but
+            // surfacing them helps users understand why an item visible in Find My
+            // doesn't appear in the output: items shared TO you arrive as
+            // SharedBeaconRecord, not MasterBeaconRecord.
+            match pcs_keys_for_record(&record, &key) {
+                Ok(pcs) => {
+                    let item = SharedBeaconRecord::from_record_encrypted(
+                        &record.record_field,
+                        Some(&pcs),
+                    );
+                    eprintln!(
+                        "  [debug] Shared id={} model={:?} owner={} accepted={}",
+                        identifier, item.model, item.owner_handle, item.accepted,
+                    );
+                }
+                Err(e) => eprintln!("  [debug] Shared id={} (pcs error: {})", identifier, e),
+            }
         }
     }
 
