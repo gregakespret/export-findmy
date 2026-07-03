@@ -81,9 +81,15 @@ credentials are never written to disk or logged.
 | Method & path | Body | Response |
 |---|---|---|
 | `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa"}` |
-| `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":["<serial>",…]}` |
+| `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":[{"serial","name","model"},…]}` |
 | `POST /sessions/{id}/escrow` | `{"device_index","passcode"}` | `200 {"state":"done","beacons":[…]}` |
 | `GET /healthz` | — | `200 {"status":"ok"}` |
+
+`devices` are the account's trusted devices (this tool's own phantom
+`F2LZN0FAKE00` bottles are filtered out), each `{serial, name, model}` — e.g.
+`{"serial":"GYK3003QMY","name":"Grega's MacBook Air","model":"MacBook Air"}` —
+so a UI can show a name rather than a serial. `device_index` in the escrow call
+is the position in this list.
 
 Each `beacon` returns the same key material as the plist output, base64-encoded
 (`private_key`, `shared_secret`, `secondary_shared_secret`,

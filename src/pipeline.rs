@@ -32,6 +32,40 @@ use rustpush::{
 
 use crate::FakeIOSConfig;
 
+/// The serial `FakeIOSConfig` registers for this tool's own device. Every run
+/// leaves one such phantom escrow bottle behind; they can never be used to join,
+/// so they're filtered out of the device picker.
+pub const FAKE_SERIAL: &str = "F2LZN0FAKE00";
+
+/// A trusted device the user can pick to unlock the escrow (by its passcode).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceInfo {
+    pub serial: String,
+    pub name: String,
+    pub model: String,
+}
+
+impl DeviceInfo {
+    /// Pull a friendly name/model out of Apple's SecureBackup `ClientMetadata`
+    /// (keys `device_name`, `device_model_class`, `device_model`), falling back
+    /// to the serial when a device didn't record a name.
+    fn from_metadata(serial: &str, md: &plist::Value) -> Self {
+        let get = |k: &str| {
+            md.as_dictionary()
+                .and_then(|d| d.get(k))
+                .and_then(|v| v.as_string())
+                .map(str::to_string)
+        };
+        DeviceInfo {
+            serial: serial.to_string(),
+            name: get("device_name").unwrap_or_else(|| serial.to_string()),
+            model: get("device_model_class")
+                .or_else(|| get("device_model"))
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// One exported AirTag's key material. Key bytes are raw here; the server
 /// base64-encodes them and the CLI writes them into plists.
 #[derive(Debug, Clone)]
@@ -99,7 +133,7 @@ impl std::error::Error for PipelineError {}
 /// login closure is `Fn() -> String`; an empty string makes login fail cleanly.
 pub trait Interact: Send + Sync {
     fn get_2fa_code(&self) -> String;
-    fn choose_bottle(&self, serials: &[String]) -> Result<usize, PipelineError>;
+    fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError>;
     fn get_passcode(&self) -> Result<String, PipelineError>;
 }
 
@@ -194,27 +228,36 @@ pub async fn run_export(
 
     // ── Step 5: Join iCloud Keychain circle via escrow ────────────
     eprintln!("[5/7] Joining iCloud Keychain trust circle...");
-    let bottles = keychain
+    let all_bottles = keychain
         .get_viable_bottles()
         .await
         .map_err(|e| PipelineError::Apple(format!("Fetching escrow bottles failed: {e}")))?;
+    // Drop this tool's own phantom device (one per past run) so the picker only
+    // offers real, usable trusted devices.
+    let bottles: Vec<_> = all_bottles
+        .into_iter()
+        .filter(|(_, meta)| meta.serial != FAKE_SERIAL)
+        .collect();
     if bottles.is_empty() {
         return Err(PipelineError::NoBottles);
     }
-    let serials: Vec<String> = bottles.iter().map(|(_, meta)| meta.serial.clone()).collect();
-    eprintln!("  Found {} escrow bottle(s):", serials.len());
-    for (i, s) in serials.iter().enumerate() {
-        eprintln!("    [{}] {}", i, s);
+    let devices: Vec<DeviceInfo> = bottles
+        .iter()
+        .map(|(_, meta)| DeviceInfo::from_metadata(&meta.serial, &meta.client_metadata))
+        .collect();
+    eprintln!("  Found {} usable device(s):", devices.len());
+    for (i, d) in devices.iter().enumerate() {
+        eprintln!("    [{}] {} ({}) [{}]", i, d.name, d.model, d.serial);
     }
-    let bottle_idx = io.choose_bottle(&serials)?;
+    let bottle_idx = io.choose_bottle(&devices)?;
     if bottle_idx >= bottles.len() {
         return Err(PipelineError::BadDeviceIndex(format!(
             "Invalid device index {bottle_idx}. Must be 0-{}.",
-            bottles.len() - 1
+            bottles.len().saturating_sub(1)
         )));
     }
-    let (bottle, meta) = &bottles[bottle_idx];
-    eprintln!("  Using escrow bottle from device: {}", meta.serial);
+    let (bottle, _) = &bottles[bottle_idx];
+    eprintln!("  Using device: {} [{}]", devices[bottle_idx].name, devices[bottle_idx].serial);
     let passcode = io.get_passcode()?;
 
     keychain

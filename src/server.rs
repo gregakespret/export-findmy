@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
-use crate::pipeline::{run_export, BeaconExport, ExportOpts, Interact, PipelineError};
+use crate::pipeline::{run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError};
 
 const INPUT_TIMEOUT: Duration = Duration::from_secs(600); // pipeline waits on the user
 const SESSION_TTL: Duration = Duration::from_secs(600);
@@ -30,7 +30,7 @@ const SESSION_TTL: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone)]
 pub enum Step {
     AwaitingTfa,
-    AwaitingEscrow { devices: Vec<String> },
+    AwaitingEscrow { devices: Vec<DeviceInfo> },
     Running,
     Done { beacons: Vec<BeaconExport> },
     Failed { error: &'static str, detail: String },
@@ -62,16 +62,16 @@ impl Interact for ServerInteract {
         .unwrap_or_default()
     }
 
-    fn choose_bottle(&self, serials: &[String]) -> Result<usize, PipelineError> {
-        let _ = self.step_tx.send(Step::AwaitingEscrow { devices: serials.to_vec() });
+    fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError> {
+        let _ = self.step_tx.send(Step::AwaitingEscrow { devices: devices.to_vec() });
         let (idx, passcode) = tokio::task::block_in_place(|| {
             self.escrow_rx.lock().unwrap().recv_timeout(INPUT_TIMEOUT)
         })
         .map_err(|_| PipelineError::Aborted)?;
-        if idx >= serials.len() {
+        if idx >= devices.len() {
             return Err(PipelineError::BadDeviceIndex(format!(
                 "Invalid device index {idx}. Must be 0-{}.",
-                serials.len().saturating_sub(1)
+                devices.len().saturating_sub(1)
             )));
         }
         *self.passcode.lock().unwrap() = Some(passcode);
@@ -356,6 +356,10 @@ mod tests {
         }
     }
 
+    fn test_device(serial: &str) -> DeviceInfo {
+        DeviceInfo { serial: serial.into(), name: format!("{serial}-name"), model: "TestModel".into() }
+    }
+
     fn sample_beacon() -> BeaconExport {
         BeaconExport {
             identifier: "2006~#abc".into(),
@@ -414,7 +418,7 @@ mod tests {
         let (id, session) = spawn_session_with(|io| async move {
             let code = io.get_2fa_code();
             assert_eq!(code, "123456");
-            let idx = io.choose_bottle(&["GYK3003QMY".into(), "J9NQHW229W".into()])?;
+            let idx = io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
             assert_eq!(idx, 1);
             let pass = io.get_passcode()?;
             assert_eq!(pass, "0000");
@@ -455,7 +459,7 @@ mod tests {
     async fn bad_device_index_fails_the_session() {
         let (_id, session) = spawn_session_with(|io| async move {
             io.get_2fa_code();
-            let idx = io.choose_bottle(&["only".into()])?; // index 5 is out of range
+            let idx = io.choose_bottle(&[test_device("only")])?; // index 5 is out of range
             let _ = io.get_passcode()?;
             Ok(vec![BeaconExport {
                 identifier: format!("idx-{idx}"),

@@ -11,7 +11,7 @@ use plist::Dictionary;
 
 use rustpush::{ActivationInfo, DebugMeta, OSConfig, PushError, RegisterMeta};
 
-use pipeline::{run_export, BeaconExport, ExportOpts, Interact, PipelineError};
+use pipeline::{run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError};
 
 // ── Fake OSConfig (presents as iPhone to avoid NAS validation) ───────
 
@@ -154,11 +154,11 @@ impl Interact for CliInteract {
         input.trim().to_string()
     }
 
-    fn choose_bottle(&self, serials: &[String]) -> Result<usize, PipelineError> {
-        if serials.len() == 1 {
+    fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError> {
+        if devices.len() == 1 {
             return Ok(0);
         }
-        eprint!("  Choose bottle [0]: ");
+        eprint!("  Choose device [0]: ");
         let mut input = String::new();
         std::io::stdin()
             .read_line(&mut input)
