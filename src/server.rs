@@ -173,23 +173,38 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
         !matches!(s, Step::Starting)
     })
     .await;
+    let (keep, status, body) = start_outcome(id, outcome);
+    if keep {
+        st.sessions.lock().await.insert(id, session);
+    } else {
+        session.task.abort();
+    }
+    (status, Json(body)).into_response()
+}
+
+/// Decide the `POST /sessions` response from login's first real step: a 2FA
+/// challenge, or — when Apple skips 2FA — the device list directly. Returns
+/// `(keep_session, status, body)`. Pure, so the contract is unit-tested.
+fn start_outcome(id: Uuid, outcome: Option<Step>) -> (bool, StatusCode, serde_json::Value) {
     match outcome {
-        Some(Step::AwaitingTfa) => {
-            st.sessions.lock().await.insert(id, session);
-            (StatusCode::CREATED,
-             Json(json!({"session_id": id, "state": "awaiting_2fa"}))).into_response()
+        Some(Step::AwaitingTfa) => (
+            true,
+            StatusCode::CREATED,
+            json!({"session_id": id, "state": "awaiting_2fa"}),
+        ),
+        Some(Step::AwaitingEscrow { devices }) => (
+            true,
+            StatusCode::CREATED,
+            json!({"session_id": id, "state": "awaiting_passcode", "devices": devices}),
+        ),
+        Some(Step::Failed { error, detail }) => {
+            (false, status_for(error), json!({"error": error, "detail": detail}))
         }
-        Some(Step::AwaitingEscrow { devices }) => {
-            st.sessions.lock().await.insert(id, session);
-            (StatusCode::CREATED,
-             Json(json!({"session_id": id, "state": "awaiting_passcode", "devices": devices})))
-                .into_response()
-        }
-        Some(Step::Failed { error, detail }) => error_response(error, detail),
-        _ => {
-            session.task.abort();
-            error_response("apple_error", "Timed out contacting Apple.".into())
-        }
+        _ => (
+            false,
+            status_for("apple_error"),
+            json!({"error": "apple_error", "detail": "Timed out contacting Apple."}),
+        ),
     }
 }
 
@@ -506,6 +521,33 @@ mod tests {
             Step::Failed { error, .. } => assert_eq!(error, "bad_device_index"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn start_outcome_maps_each_first_step() {
+        let id = Uuid::new_v4();
+
+        // Normal: 2FA required.
+        let (keep, status, body) = start_outcome(id, Some(Step::AwaitingTfa));
+        assert!(keep && status == StatusCode::CREATED);
+        assert_eq!(body["state"], "awaiting_2fa");
+        assert!(body.get("devices").is_none());
+
+        // 2FA skipped: device list returned directly so the client skips /2fa.
+        let devices = vec![test_device("GYK3003QMY")];
+        let (keep, status, body) = start_outcome(id, Some(Step::AwaitingEscrow { devices }));
+        assert!(keep && status == StatusCode::CREATED);
+        assert_eq!(body["state"], "awaiting_passcode");
+        assert_eq!(body["devices"][0]["serial"], "GYK3003QMY");
+        assert_eq!(body["devices"][0]["name"], "GYK3003QMY-name");
+
+        // Bad credentials: don't keep the session, surface the error.
+        let (keep, status, body) = start_outcome(
+            id,
+            Some(Step::Failed { error: "bad_credentials", detail: "nope".into() }),
+        );
+        assert!(!keep && status == StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "bad_credentials");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
