@@ -38,6 +38,8 @@ The tool will prompt for:
 | `--apple-id <email>` | Apple ID email | prompted if omitted |
 | `--anisette-url <url>` | Anisette v3 server URL | `https://ani.sidestore.io` |
 | `--output-dir <dir>` | Where to write plist files | `.` |
+| `--serve` | Run the localhost REST API instead of the CLI export (see below) | off |
+| `--port <n>` | Port for `--serve` (binds `127.0.0.1` only) | `5301` |
 
 ### Example
 
@@ -62,6 +64,34 @@ Password:
 
 Done! Exported 1 accessory plist file(s) to ./keys
 ```
+
+## Server mode (`--serve`)
+
+For driving the export from a web UI (rather than a terminal), `--serve`
+exposes the same login → escrow → CloudKit pipeline as a small REST API. It
+holds the Apple login session open between requests so the 2FA code, device
+choice, and passcode can arrive one HTTP call at a time. The server binds
+`127.0.0.1` only and keeps all session state in memory (10-minute idle TTL);
+credentials are never written to disk or logged.
+
+```bash
+./target/release/export-findmy --serve --port 5301
+```
+
+| Method & path | Body | Response |
+|---|---|---|
+| `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa"}` |
+| `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":["<serial>",…]}` |
+| `POST /sessions/{id}/escrow` | `{"device_index","passcode"}` | `200 {"state":"done","beacons":[…]}` |
+| `GET /healthz` | — | `200 {"status":"ok"}` |
+
+Each `beacon` returns the same key material as the plist output, base64-encoded
+(`private_key`, `shared_secret`, `secondary_shared_secret`,
+`secure_locations_shared_secret`, `public_key`) plus `identifier`, `name`,
+`emoji`, `model`, and `pairing_date` (RFC3339). Errors are
+`{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`,
+`bad_2fa_code`, `bad_passcode`, `bad_device_index`, `no_bottles`,
+`session_not_found`, `session_expired`, `apple_error`.
 
 ## Output format
 
