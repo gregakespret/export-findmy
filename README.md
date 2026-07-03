@@ -80,10 +80,15 @@ credentials are never written to disk or logged.
 
 | Method & path | Body | Response |
 |---|---|---|
-| `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa"}` |
+| `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa"}` — or `"awaiting_passcode"` + `devices` if Apple already trusts the session and skips 2FA |
 | `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":[{"serial","name","model"},…]}` |
 | `POST /sessions/{id}/escrow` | `{"device_index","passcode"}` | `200 {"state":"done","beacons":[…]}` |
 | `GET /healthz` | — | `200 {"status":"ok"}` |
+
+When Apple already trusts the session (a recent successful login from the same
+anisette identity), the login skips 2FA — then `POST /sessions` returns
+`awaiting_passcode` with the `devices` list directly, and the client goes
+straight to `/escrow` without calling `/2fa`.
 
 `devices` are the account's trusted devices (this tool's own phantom
 `F2LZN0FAKE00` bottles are filtered out), each `{serial, name, model}` — e.g.

@@ -29,6 +29,8 @@ const SESSION_TTL: Duration = Duration::from_secs(600);
 /// await transitions.
 #[derive(Debug, Clone)]
 pub enum Step {
+    /// Initial state, before login has determined whether 2FA is required.
+    Starting,
     AwaitingTfa,
     AwaitingEscrow { devices: Vec<DeviceInfo> },
     Running,
@@ -99,7 +101,7 @@ where
     F: FnOnce(Arc<ServerInteract>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<Vec<BeaconExport>, PipelineError>> + Send,
 {
-    let (step_tx, step_rx) = watch::channel(Step::AwaitingTfa);
+    let (step_tx, step_rx) = watch::channel(Step::Starting);
     let (tfa_tx, tfa_rx) = std::sync::mpsc::channel();
     let (escrow_tx, escrow_rx) = std::sync::mpsc::channel();
     let interact = Arc::new(ServerInteract {
@@ -163,15 +165,32 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
         debug: false,
     };
     let (id, session) = spawn_session(opts);
-    // Surface an obviously-bad password (SRP fails before 2FA) at step 1.
+    // Wait until login has decided what's next: a 2FA challenge, or — if Apple
+    // already trusts this session and skips 2FA — straight to device selection.
+    // (Login → the device list can take a bit, so allow a generous window.)
     let mut rx = session.step_rx.clone();
-    if let Some(Step::Failed { error, detail }) =
-        wait_for(&mut rx, Duration::from_secs(4), |s| matches!(s, Step::Failed { .. })).await
-    {
-        return error_response(error, detail);
+    let outcome = wait_for(&mut rx, Duration::from_secs(180), |s| {
+        !matches!(s, Step::Starting)
+    })
+    .await;
+    match outcome {
+        Some(Step::AwaitingTfa) => {
+            st.sessions.lock().await.insert(id, session);
+            (StatusCode::CREATED,
+             Json(json!({"session_id": id, "state": "awaiting_2fa"}))).into_response()
+        }
+        Some(Step::AwaitingEscrow { devices }) => {
+            st.sessions.lock().await.insert(id, session);
+            (StatusCode::CREATED,
+             Json(json!({"session_id": id, "state": "awaiting_passcode", "devices": devices})))
+                .into_response()
+        }
+        Some(Step::Failed { error, detail }) => error_response(error, detail),
+        _ => {
+            session.task.abort();
+            error_response("apple_error", "Timed out contacting Apple.".into())
+        }
     }
-    st.sessions.lock().await.insert(id, session);
-    (StatusCode::CREATED, Json(json!({"session_id": id, "state": "awaiting_2fa"}))).into_response()
 }
 
 async fn submit_2fa(
@@ -487,5 +506,24 @@ mod tests {
             Step::Failed { error, .. } => assert_eq!(error, "bad_device_index"),
             _ => panic!(),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skip_2fa_goes_straight_to_escrow() {
+        // When login needs no 2FA (Apple already trusts the session), the runner
+        // never calls get_2fa_code, so the step goes Starting -> AwaitingEscrow
+        // directly and never becomes AwaitingTfa. This is what lets POST /sessions
+        // report `awaiting_passcode` and the wizard skip the 2FA screen.
+        let (_id, session) = spawn_session_with(|io| async move {
+            let idx = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+            assert_eq!(idx, 0);
+            let _ = io.get_passcode()?;
+            Ok(vec![sample_beacon()])
+        });
+        let mut rx = session.step_rx.clone();
+        let step = wait_for(&mut rx, Duration::from_secs(5), |s| !matches!(s, Step::Starting))
+            .await
+            .expect("left Starting");
+        assert!(matches!(step, Step::AwaitingEscrow { .. }), "expected escrow, got {step:?}");
     }
 }
