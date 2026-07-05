@@ -38,6 +38,8 @@ The tool will prompt for:
 | `--apple-id <email>` | Apple ID email | prompted if omitted |
 | `--anisette-url <url>` | Anisette v3 server URL | `https://ani.sidestore.io` |
 | `--output-dir <dir>` | Where to write plist files | `.` |
+| `--serve` | Run the localhost REST API instead of the CLI export (see below) | off |
+| `--port <n>` | Port for `--serve` (binds `127.0.0.1` only) | `5301` |
 
 ### Example
 
@@ -62,6 +64,46 @@ Password:
 
 Done! Exported 1 accessory plist file(s) to ./keys
 ```
+
+## Server mode (`--serve`)
+
+For driving the export from a web UI (rather than a terminal), `--serve`
+exposes the same login → escrow → CloudKit pipeline as a small REST API. It
+holds the Apple login session open between requests so the 2FA code, device
+choice, and passcode can arrive one HTTP call at a time. The server binds
+`127.0.0.1` only and keeps all session state in memory (10-minute idle TTL);
+credentials are never written to disk or logged.
+
+```bash
+./target/release/export-findmy --serve --port 5301
+```
+
+| Method & path | Body | Response |
+|---|---|---|
+| `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa"}` — or `"awaiting_passcode"` + `devices` if Apple already trusts the session and skips 2FA |
+| `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":[{"serial","name","model"},…]}` |
+| `POST /sessions/{id}/escrow` | `{"device_index","passcode"}` | `200 {"state":"done","beacons":[…]}` |
+| `GET /healthz` | — | `200 {"status":"ok"}` |
+
+When Apple already trusts the session (a recent successful login from the same
+anisette identity), the login skips 2FA — then `POST /sessions` returns
+`awaiting_passcode` with the `devices` list directly, and the client goes
+straight to `/escrow` without calling `/2fa`.
+
+`devices` are the account's trusted devices (this tool's own phantom
+`F2LZN0FAKE00` bottles are filtered out), each `{serial, name, model}` — e.g.
+`{"serial":"GYK3003QMY","name":"Grega's MacBook Air","model":"MacBook Air"}` —
+so a UI can show a name rather than a serial. `device_index` in the escrow call
+is the position in this list.
+
+Each `beacon` returns the same key material as the plist output, base64-encoded
+(`private_key`, `shared_secret`, `secondary_shared_secret`,
+`secure_locations_shared_secret`, `public_key`) plus `identifier`, `name`,
+`emoji`, `model`, and `pairing_date` (RFC3339). Errors are
+`{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
+(covers a wrong password *or* a wrong 2FA code — rustpush's login doesn't
+distinguish them), `bad_passcode`, `bad_device_index`, `no_bottles`,
+`wrong_step`, `session_not_found`, `session_expired`, `apple_error`.
 
 ## Output format
 
