@@ -407,3 +407,69 @@ fn rfc3339_secs(t: SystemTime) -> String {
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn md(pairs: &[(&str, &str)]) -> plist::Value {
+        let mut d = plist::Dictionary::new();
+        for (k, v) in pairs {
+            d.insert((*k).into(), plist::Value::String((*v).into()));
+        }
+        plist::Value::Dictionary(d)
+    }
+
+    #[test]
+    fn device_info_prefers_name_and_model_class() {
+        let info = DeviceInfo::from_metadata(
+            "GYK3003QMY",
+            &md(&[
+                ("device_name", "Grega's MacBook Air"),
+                ("device_model_class", "MacBook Air"),
+                ("device_model", "Mac17,4"),
+            ]),
+        );
+        assert_eq!(info.serial, "GYK3003QMY");
+        assert_eq!(info.name, "Grega's MacBook Air");
+        assert_eq!(info.model, "MacBook Air"); // class preferred over device_model
+    }
+
+    #[test]
+    fn device_info_falls_back_to_model_then_serial() {
+        // No model_class → device_model; no device_name → serial.
+        let info = DeviceInfo::from_metadata("J9NQHW229W", &md(&[("device_model", "iPhone 16")]));
+        assert_eq!(info.name, "J9NQHW229W");
+        assert_eq!(info.model, "iPhone 16");
+
+        // Empty metadata → serial as name, empty model.
+        let info = DeviceInfo::from_metadata("SER", &md(&[]));
+        assert_eq!(info.name, "SER");
+        assert_eq!(info.model, "");
+    }
+
+    #[test]
+    fn rfc3339_secs_truncates_to_whole_seconds() {
+        assert_eq!(rfc3339_secs(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        // Sub-second precision is dropped — Apple's plist parser rejects it.
+        let t = UNIX_EPOCH + Duration::from_millis(1_500);
+        assert_eq!(rfc3339_secs(t), "1970-01-01T00:00:01Z");
+        let t = UNIX_EPOCH + Duration::from_nanos(1_736_625_462_920_991_898);
+        let s = rfc3339_secs(t);
+        assert!(!s.contains('.') && s.ends_with('Z'), "no fractional seconds: {s}");
+    }
+
+    #[test]
+    fn pipeline_error_codes_and_messages() {
+        assert_eq!(PipelineError::BadCredentials("x".into()).code(), "bad_credentials");
+        assert_eq!(PipelineError::BadPasscode("x".into()).code(), "bad_passcode");
+        assert_eq!(PipelineError::BadDeviceIndex("x".into()).code(), "bad_device_index");
+        assert_eq!(PipelineError::NoBottles.code(), "no_bottles");
+        assert_eq!(PipelineError::Apple("x".into()).code(), "apple_error");
+        // A local input timeout is not Apple's fault.
+        assert_eq!(PipelineError::Aborted.code(), "session_expired");
+        // Display is never empty — it becomes the JSON `detail`.
+        assert!(!PipelineError::NoBottles.to_string().is_empty());
+        assert!(!PipelineError::Aborted.to_string().is_empty());
+    }
+}

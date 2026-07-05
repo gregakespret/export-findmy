@@ -86,11 +86,17 @@ impl Interact for ServerInteract {
     }
 }
 
+/// How `create_session` turns login options into a running session task. In
+/// production this is `spawn_session` (the real pipeline); tests inject a
+/// scripted spawner so the HTTP handlers can be driven end-to-end without Apple.
+type Spawner = Arc<dyn Fn(ExportOpts) -> (Uuid, Arc<Session>) + Send + Sync>;
+
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<Mutex<HashMap<Uuid, Arc<Session>>>>,
     expired: Arc<Mutex<HashSet<Uuid>>>,
     anisette_url: Arc<String>,
+    spawn: Spawner,
 }
 
 /// Spawn a session task driven by an arbitrary async runner. `spawn_session`
@@ -176,7 +182,7 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
         anisette_url: (*st.anisette_url).clone(),
         debug: false,
     };
-    let (id, session) = spawn_session(opts);
+    let (id, session) = (st.spawn)(opts);
     // Track the session BEFORE waiting so that if the client disconnects during
     // the wait (dropping this handler), the task is still reachable by the reaper
     // rather than orphaned.
@@ -443,6 +449,7 @@ pub async fn serve(port: u16, anisette_url: String) -> Result<(), Box<dyn std::e
         sessions: Arc::new(Mutex::new(HashMap::new())),
         expired: Arc::new(Mutex::new(HashSet::new())),
         anisette_url: Arc::new(anisette_url),
+        spawn: Arc::new(|opts| spawn_session(opts)),
     };
     tokio::spawn(reap_loop(state.clone()));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -456,12 +463,81 @@ mod tests {
     use super::*;
     use tower::ServiceExt; // oneshot
 
-    fn test_state() -> AppState {
+    fn state_with(spawn: Spawner) -> AppState {
         AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             expired: Arc::new(Mutex::new(HashSet::new())),
             anisette_url: Arc::new("https://example".into()),
+            spawn,
         }
+    }
+
+    /// State whose spawner panics if used — for handler tests that never hit
+    /// POST /sessions (healthz, unknown-session).
+    fn test_state() -> AppState {
+        state_with(Arc::new(|_| panic!("spawn should not be called in this test")))
+    }
+
+    /// Scripted spawner: normal 2FA flow → two devices → one beacon on Done.
+    fn spawn_normal() -> Spawner {
+        Arc::new(|_opts| {
+            spawn_session_with(|io| async move {
+                let _code = io.get_2fa_code(); // parks until POST /2fa
+                let idx =
+                    io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
+                assert!(idx < 2);
+                let _pass = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        })
+    }
+
+    /// Scripted spawner: 2FA skipped → straight to device selection.
+    fn spawn_skip_2fa() -> Spawner {
+        Arc::new(|_opts| {
+            spawn_session_with(|io| async move {
+                let _idx = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _pass = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        })
+    }
+
+    /// Scripted spawner: login fails before 2FA.
+    fn spawn_err(mk: fn() -> PipelineError) -> Spawner {
+        Arc::new(move |_opts| {
+            spawn_session_with(move |_io| async move {
+                Err::<Vec<BeaconExport>, PipelineError>(mk())
+            })
+        })
+    }
+
+    /// Drive one request through the real axum router against shared state.
+    async fn req(
+        st: &AppState,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = router(st.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, json)
     }
 
     fn test_device(serial: &str) -> DeviceInfo {
@@ -550,7 +626,6 @@ mod tests {
             Step::Done { beacons } => {
                 assert_eq!(beacons.len(), 1);
                 assert_eq!(beacon_json(&beacons[0])["identifier"], "2006~#abc");
-                // base64("\x03\x03\x03\x03") = "AwMDAw=="
                 assert_eq!(beacons[0].secondary_shared_secret, None);
             }
             _ => panic!(),
@@ -636,5 +711,110 @@ mod tests {
             .await
             .expect("left Starting");
         assert!(matches!(step, Step::AwaitingEscrow { .. }), "expected escrow, got {step:?}");
+    }
+
+    // ── Router-level integration tests (drive the real handlers) ────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_full_flow_start_2fa_escrow() {
+        let st = state_with(spawn_normal());
+
+        let (s1, b1) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        assert_eq!(s1, StatusCode::CREATED);
+        assert_eq!(b1["state"], "awaiting_2fa");
+        let id = b1["session_id"].as_str().unwrap().to_string();
+
+        let (s2, b2) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"123456"}"#).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(b2["state"], "awaiting_passcode");
+        assert_eq!(b2["devices"][0]["serial"], "GYK3003QMY");
+        assert_eq!(b2["devices"][1]["serial"], "J9NQHW229W");
+
+        let (s3, b3) = req(
+            &st, "POST", &format!("/sessions/{id}/escrow"),
+            r#"{"device_index":1,"passcode":"0000"}"#,
+        ).await;
+        assert_eq!(s3, StatusCode::OK);
+        assert_eq!(b3["state"], "done");
+        assert_eq!(b3["beacons"][0]["identifier"], "2006~#abc");
+        assert_eq!(b3["beacons"][0]["private_key"], "AQEBAQ=="); // base64([1;4])
+
+        // Session is gone after Done.
+        let (s4, _) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"x"}"#).await;
+        assert_eq!(s4, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_skip_2fa_returns_devices_from_post_sessions() {
+        let st = state_with(spawn_skip_2fa());
+
+        let (s1, b1) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        assert_eq!(s1, StatusCode::CREATED);
+        assert_eq!(b1["state"], "awaiting_passcode");
+        assert_eq!(b1["devices"][0]["serial"], "GYK3003QMY");
+        let id = b1["session_id"].as_str().unwrap().to_string();
+
+        // Straight to escrow — no /2fa call.
+        let (s2, b2) = req(
+            &st, "POST", &format!("/sessions/{id}/escrow"),
+            r#"{"device_index":0,"passcode":"0000"}"#,
+        ).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(b2["state"], "done");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_bad_credentials_returns_401_and_retires_session() {
+        let st = state_with(spawn_err(|| PipelineError::BadCredentials("nope".into())));
+
+        let (s1, b1) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"bad"}"#).await;
+        assert_eq!(s1, StatusCode::UNAUTHORIZED);
+        assert_eq!(b1["error"], "bad_credentials");
+        let id = b1.get("session_id").and_then(|v| v.as_str());
+        // create_session doesn't return an id on failure, but the reaper/retire
+        // path is exercised: no session lingers in the map.
+        assert!(id.is_none());
+        assert!(st.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_escrow_before_2fa_is_rejected_wrong_step() {
+        // An out-of-order /escrow must NOT buffer a passcode against the wrong
+        // device — it returns 409 and the session stays usable for /2fa.
+        let st = state_with(spawn_normal());
+        let (_s1, b1) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b1["session_id"].as_str().unwrap().to_string();
+
+        let (s2, b2) = req(
+            &st, "POST", &format!("/sessions/{id}/escrow"),
+            r#"{"device_index":0,"passcode":"0000"}"#,
+        ).await;
+        assert_eq!(s2, StatusCode::CONFLICT);
+        assert_eq!(b2["error"], "wrong_step");
+
+        // The proper /2fa still works afterwards (nothing was consumed).
+        let (s3, b3) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"123456"}"#).await;
+        assert_eq!(s3, StatusCode::OK);
+        assert_eq!(b3["state"], "awaiting_passcode");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_unknown_session_404_and_expired_410() {
+        let st = state_with(spawn_err(|| PipelineError::BadCredentials("nope".into())));
+        // Unknown id → 404.
+        let random = Uuid::new_v4();
+        let (s1, _) = req(&st, "POST", &format!("/sessions/{random}/escrow"),
+                          r#"{"device_index":0,"passcode":"0"}"#).await;
+        assert_eq!(s1, StatusCode::NOT_FOUND);
+
+        // A failed start retires its id; but create_session doesn't expose it, so
+        // assert the expired set is populated and yields 410 for that id.
+        req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"bad"}"#).await;
+        let expired: Vec<Uuid> = st.expired.lock().await.iter().copied().collect();
+        assert_eq!(expired.len(), 1);
+        let (s2, b2) = req(&st, "POST", &format!("/sessions/{}/2fa", expired[0]),
+                           r#"{"code":"1"}"#).await;
+        assert_eq!(s2, StatusCode::GONE);
+        assert_eq!(b2["error"], "session_expired");
     }
 }

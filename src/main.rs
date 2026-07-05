@@ -347,3 +347,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn beacon(pairing: Option<&str>, public: Option<Vec<u8>>) -> BeaconExport {
+        BeaconExport {
+            identifier: "2006~#abc".into(),
+            name: "Keys".into(),
+            emoji: "🔑".into(),
+            model: "AirTag".into(),
+            private_key: vec![1, 2, 3],
+            shared_secret: vec![4, 5, 6],
+            secondary_shared_secret: None,
+            secure_locations_shared_secret: Some(vec![7, 8]),
+            public_key: public,
+            pairing_date: pairing.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn beacon_to_plist_has_expected_keys() {
+        let v = beacon_to_plist(&beacon(Some("2026-01-11T19:57:42Z"), Some(vec![9])));
+        let d = v.as_dictionary().unwrap();
+        assert_eq!(d.get("identifier").unwrap().as_string(), Some("2006~#abc"));
+        assert_eq!(d.get("name").unwrap().as_string(), Some("Keys"));
+        assert_eq!(d.get("emoji").unwrap().as_string(), Some("🔑"));
+        assert_eq!(d.get("model").unwrap().as_string(), Some("AirTag"));
+        assert!(matches!(d.get("privateKey"), Some(plist::Value::Data(_))));
+        assert!(matches!(d.get("sharedSecret"), Some(plist::Value::Data(_))));
+        assert!(matches!(d.get("secureLocationsSharedSecret"), Some(plist::Value::Data(_))));
+        assert!(matches!(d.get("publicKey"), Some(plist::Value::Data(_))));
+        assert!(matches!(d.get("pairingDate"), Some(plist::Value::Date(_))));
+        // Absent optional is omitted, not written as null.
+        assert!(d.get("secondarySharedSecret").is_none());
+    }
+
+    #[test]
+    fn beacon_to_plist_omits_absent_optionals() {
+        let v = beacon_to_plist(&beacon(None, None));
+        let d = v.as_dictionary().unwrap();
+        assert!(d.get("publicKey").is_none());
+        assert!(d.get("pairingDate").is_none());
+    }
+
+    #[test]
+    fn beacon_to_plist_drops_unparseable_pairing_date() {
+        // A malformed date must not crash or write garbage — the key is dropped.
+        let v = beacon_to_plist(&beacon(Some("not-a-date"), None));
+        assert!(v.as_dictionary().unwrap().get("pairingDate").is_none());
+    }
+}
