@@ -105,7 +105,9 @@ impl PipelineError {
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
             PipelineError::NoBottles => "no_bottles",
             PipelineError::Apple(_) => "apple_error",
-            PipelineError::Aborted => "apple_error",
+            // Aborted is a local input timeout/cancellation, not an Apple fault —
+            // the attempt lapsed, so report it as an expired session (410).
+            PipelineError::Aborted => "session_expired",
         }
     }
 }
@@ -376,21 +378,24 @@ pub async fn run_export(
     }
 
     eprintln!("[7/7] Assembling {} accessory export(s)...", accessories.len());
-    Ok(accessories.values().map(beacon_export).collect())
+    // Move the accessories (and their secret key bytes) into the exports rather
+    // than cloning — accessories is dropped right after.
+    Ok(accessories.into_values().map(beacon_export).collect())
 }
 
-fn beacon_export(acc: &BeaconAccessory) -> BeaconExport {
+fn beacon_export(acc: BeaconAccessory) -> BeaconExport {
+    let m = acc.master_record;
     BeaconExport {
-        identifier: acc.master_record.stable_identifier.clone(),
-        name: acc.naming.name.clone(),
-        emoji: acc.naming.emoji.clone(),
-        model: acc.master_record.model.clone(),
-        private_key: acc.master_record.private_key.clone(),
-        shared_secret: acc.master_record.shared_secret.clone(),
-        secondary_shared_secret: acc.master_record.shared_secret_2.clone(),
-        secure_locations_shared_secret: acc.master_record.secure_locations_shared_secret.clone(),
-        public_key: Some(acc.master_record.public_key.clone()),
-        pairing_date: acc.master_record.pairing_date.map(rfc3339_secs),
+        identifier: m.stable_identifier,
+        name: acc.naming.name,
+        emoji: acc.naming.emoji,
+        model: m.model,
+        private_key: m.private_key,
+        shared_secret: m.shared_secret,
+        secondary_shared_secret: m.shared_secret_2,
+        secure_locations_shared_secret: m.secure_locations_shared_secret,
+        public_key: Some(m.public_key),
+        pairing_date: m.pairing_date.map(rfc3339_secs),
     }
 }
 

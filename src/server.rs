@@ -99,7 +99,7 @@ struct AppState {
 pub fn spawn_session_with<F, Fut>(runner: F) -> (Uuid, Arc<Session>)
 where
     F: FnOnce(Arc<ServerInteract>) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<Vec<BeaconExport>, PipelineError>> + Send,
+    Fut: Future<Output = Result<Vec<BeaconExport>, PipelineError>> + Send + 'static,
 {
     let (step_tx, step_rx) = watch::channel(Step::Starting);
     let (tfa_tx, tfa_rx) = std::sync::mpsc::channel();
@@ -113,9 +113,21 @@ where
     let task = tokio::spawn({
         let interact = interact.clone();
         async move {
-            let final_step = match runner(interact.clone()).await {
-                Ok(beacons) => Step::Done { beacons },
-                Err(e) => Step::Failed { error: e.code(), detail: e.to_string() },
+            // Run the pipeline on an inner task so a panic (e.g. an unwrap on
+            // unexpected Apple/CloudKit data) becomes a JoinError we can turn
+            // into Failed — otherwise the panic unwinds past the step publish
+            // and every waiting handler hangs to its timeout.
+            let inner = tokio::spawn({
+                let interact = interact.clone();
+                async move { runner(interact).await }
+            });
+            let final_step = match inner.await {
+                Ok(Ok(beacons)) => Step::Done { beacons },
+                Ok(Err(e)) => Step::Failed { error: e.code(), detail: e.to_string() },
+                Err(_) => Step::Failed {
+                    error: "apple_error",
+                    detail: "The export failed unexpectedly.".into(),
+                },
             };
             let _ = interact.step_tx.send(final_step);
         }
@@ -165,6 +177,10 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
         debug: false,
     };
     let (id, session) = spawn_session(opts);
+    // Track the session BEFORE waiting so that if the client disconnects during
+    // the wait (dropping this handler), the task is still reachable by the reaper
+    // rather than orphaned.
+    st.sessions.lock().await.insert(id, session.clone());
     // Wait until login has decided what's next: a 2FA challenge, or — if Apple
     // already trusts this session and skips 2FA — straight to device selection.
     // (Login → the device list can take a bit, so allow a generous window.)
@@ -174,10 +190,9 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
     })
     .await;
     let (keep, status, body) = start_outcome(id, outcome);
-    if keep {
-        st.sessions.lock().await.insert(id, session);
-    } else {
+    if !keep {
         session.task.abort();
+        retire(&st, id).await;
     }
     (status, Json(body)).into_response()
 }
@@ -217,6 +232,12 @@ async fn submit_2fa(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // Reject an out-of-order post: the code channel is only drained at
+    // AwaitingTfa, so sending now would buffer a value that's consumed
+    // sight-unseen later (or never).
+    if !matches!(&*session.step_rx.borrow(), Step::AwaitingTfa) {
+        return wrong_step();
+    }
     let _ = session.tfa_tx.send(body.code);
     let mut rx = session.step_rx.clone();
     match wait_for(&mut rx, Duration::from_secs(180), |s| !matches!(s, Step::AwaitingTfa)).await {
@@ -225,10 +246,14 @@ async fn submit_2fa(
                 .into_response()
         }
         Some(Step::Failed { error, detail }) => {
-            remove(&st, id).await;
+            retire(&st, id).await;
             error_response(error, detail)
         }
-        _ => error_response("apple_error", "Timed out waiting for Apple.".into()),
+        _ => {
+            session.task.abort();
+            retire(&st, id).await;
+            error_response("apple_error", "Timed out waiting for Apple.".into())
+        }
     }
 }
 
@@ -241,6 +266,12 @@ async fn submit_escrow(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // Reject an out-of-order post (e.g. /escrow before /2fa): sending now would
+    // buffer a (device_index, passcode) tuple that choose_bottle later consumes
+    // against a device the user never saw — burning an Apple escrow attempt.
+    if !matches!(&*session.step_rx.borrow(), Step::AwaitingEscrow { .. }) {
+        return wrong_step();
+    }
     let _ = session.escrow_tx.send((body.device_index, body.passcode));
     let mut rx = session.step_rx.clone();
     // The escrow join + CloudKit sync can take a while.
@@ -248,14 +279,23 @@ async fn submit_escrow(
         matches!(s, Step::Done { .. } | Step::Failed { .. })
     })
     .await;
-    remove(&st, id).await;
     match done {
         Some(Step::Done { beacons }) => {
+            remove(&st, id).await;
             let beacons: Vec<_> = beacons.iter().map(beacon_json).collect();
             (StatusCode::OK, Json(json!({"state": "done", "beacons": beacons}))).into_response()
         }
-        Some(Step::Failed { error, detail }) => error_response(error, detail),
-        _ => error_response("apple_error", "Timed out waiting for Apple.".into()),
+        Some(Step::Failed { error, detail }) => {
+            retire(&st, id).await;
+            error_response(error, detail)
+        }
+        _ => {
+            // Still running past our budget — abort so the task doesn't keep
+            // running (holding extracted keys) with no one able to reach it.
+            session.task.abort();
+            retire(&st, id).await;
+            error_response("apple_error", "Timed out waiting for Apple.".into())
+        }
     }
 }
 
@@ -274,6 +314,25 @@ async fn touch(st: &AppState, id: Uuid) -> Result<Arc<Session>, Response> {
 
 async fn remove(st: &AppState, id: Uuid) {
     st.sessions.lock().await.remove(&id);
+}
+
+/// Remove a session and remember it as expired, so a later request for it gets
+/// a consistent 410 (rather than 404 depending on which teardown path ran).
+async fn retire(st: &AppState, id: Uuid) {
+    st.sessions.lock().await.remove(&id);
+    st.expired.lock().await.insert(id);
+}
+
+/// 409 for a request that arrives at the wrong point in the flow.
+fn wrong_step() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "wrong_step",
+            "detail": "This connection isn't ready for that step — start over."
+        })),
+    )
+        .into_response()
 }
 
 async fn wait_for(
@@ -316,9 +375,7 @@ fn beacon_json(b: &BeaconExport) -> serde_json::Value {
 fn status_for(code: &str) -> StatusCode {
     match code {
         "bad_credentials" => StatusCode::UNAUTHORIZED,
-        "bad_2fa_code" | "bad_passcode" | "bad_device_index" | "no_bottles" => {
-            StatusCode::BAD_REQUEST
-        }
+        "bad_passcode" | "bad_device_index" | "no_bottles" => StatusCode::BAD_REQUEST,
         "session_not_found" => StatusCode::NOT_FOUND,
         "session_expired" => StatusCode::GONE,
         _ => StatusCode::BAD_GATEWAY,
@@ -338,6 +395,16 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// A session is reapable when it has been idle past the TTL AND is not actively
+/// running the escrow/CloudKit work (which can legitimately exceed the TTL — we
+/// must not abort a live export out from under the escrow handler's 900s wait).
+fn is_reapable(s: &Session) -> bool {
+    if matches!(&*s.step_rx.borrow(), Step::Running) {
+        return false;
+    }
+    s.last_touch.lock().unwrap().elapsed() > SESSION_TTL
+}
+
 async fn reap_loop(st: AppState) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -345,7 +412,7 @@ async fn reap_loop(st: AppState) {
         {
             let sessions = st.sessions.lock().await;
             for (id, s) in sessions.iter() {
-                if s.last_touch.lock().unwrap().elapsed() > SESSION_TTL {
+                if is_reapable(s) {
                     dead.push(*id);
                 }
             }
@@ -356,6 +423,13 @@ async fn reap_loop(st: AppState) {
         let mut sessions = st.sessions.lock().await;
         let mut expired = st.expired.lock().await;
         for id in dead {
+            // Re-check under the lock: a session touched or become active between
+            // the scan and now must not be aborted mid-flight.
+            match sessions.get(&id) {
+                Some(s) if !is_reapable(s) => continue,
+                None => continue,
+                _ => {}
+            }
             if let Some(s) = sessions.remove(&id) {
                 s.task.abort();
             }
@@ -407,11 +481,6 @@ mod tests {
             public_key: None,
             pairing_date: Some("2026-01-11T19:57:42Z".into()),
         }
-    }
-
-    async fn body_json(resp: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]

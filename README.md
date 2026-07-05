@@ -100,9 +100,10 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 (`private_key`, `shared_secret`, `secondary_shared_secret`,
 `secure_locations_shared_secret`, `public_key`) plus `identifier`, `name`,
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
-`{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`,
-`bad_2fa_code`, `bad_passcode`, `bad_device_index`, `no_bottles`,
-`session_not_found`, `session_expired`, `apple_error`.
+`{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
+(covers a wrong password *or* a wrong 2FA code — rustpush's login doesn't
+distinguish them), `bad_passcode`, `bad_device_index`, `no_bottles`,
+`wrong_step`, `session_not_found`, `session_expired`, `apple_error`.
 
 ## Output format
 

@@ -212,6 +212,11 @@ fn disable_echo_read() -> String {
 
 // ── Main ────────────────────────────────────────────────────────────────
 
+fn arg_err(flag: &str) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("Missing value for {flag}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
@@ -238,15 +243,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "--apple-id" => {
                 i += 1;
-                apple_id = args[i].clone();
+                match args.get(i) {
+                    Some(v) => apple_id = v.clone(),
+                    None => return arg_err("--apple-id"),
+                }
             }
             "--anisette-url" => {
                 i += 1;
-                anisette_url = args[i].clone();
+                match args.get(i) {
+                    Some(v) => anisette_url = v.clone(),
+                    None => return arg_err("--anisette-url"),
+                }
             }
             "--output-dir" => {
                 i += 1;
-                output_dir = PathBuf::from(&args[i]);
+                match args.get(i) {
+                    Some(v) => output_dir = PathBuf::from(v),
+                    None => return arg_err("--output-dir"),
+                }
             }
             "--debug" => {
                 debug = true;
@@ -256,7 +270,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--port" => {
                 i += 1;
-                port = args[i].parse().unwrap_or(5301);
+                match args.get(i).and_then(|v| v.parse::<u16>().ok()) {
+                    Some(p) => port = p,
+                    None => {
+                        eprintln!("--port needs a valid port number (1-65535)");
+                        return Ok(());
+                    }
+                }
             }
             "--help" | "-h" => {
                 eprintln!("Usage: export_findmy [OPTIONS]");
