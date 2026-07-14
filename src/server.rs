@@ -452,8 +452,12 @@ pub async fn serve(port: u16, anisette_url: String) -> Result<(), Box<dyn std::e
         spawn: Arc::new(|opts| spawn_session(opts)),
     };
     tokio::spawn(reap_loop(state.clone()));
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    eprintln!("export-findmy serving on http://127.0.0.1:{port}");
+    // Default to loopback so the security posture is unchanged for local use.
+    // Set EXPORT_FINDMY_BIND to a non-loopback address (e.g. `::` for Railway's
+    // IPv6 private network) to reach the service from another container.
+    let bind_host = std::env::var("EXPORT_FINDMY_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listener = tokio::net::TcpListener::bind((bind_host.as_str(), port)).await?;
+    eprintln!("export-findmy serving on http://{bind_host}:{port}");
     axum::serve(listener, router(state)).await?;
     Ok(())
 }
