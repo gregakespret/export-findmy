@@ -1,0 +1,6 @@
+# keystore/ (a rustpush workspace member we depend on via git) uses Rust
+# edition 2024, which requires the toolchain to be >= 1.85. Pin a modern
+# stable so every build environment (local, CI, Railway/Railpack — whose
+# edition-2021 default is 1.84) resolves the dependency graph identically.
+[toolchain]
+channel = "1.89.0"
