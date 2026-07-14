@@ -141,4 +141,11 @@ These files can be used directly with [FindMy.py](https://github.com/malmeloo/Fi
 5. Decrypts records using PCS (Protected CloudStorage) keys from the keychain
 6. Writes accessory data to plist files
 
+## Deployment
+
+In production this runs as a private `--serve` service on Railway, reachable only
+by the airtag-tracker backend over Railway's internal network. It builds with
+Rust 1.89 (see `rust-toolchain.toml`), needs `protoc` at build time, and binds
+`EXPORT_FINDMY_BIND=::`. Every push to `main` auto-deploys.
+
 Built on [rustpush](https://github.com/OpenBubbles/rustpush) by the OpenBubbles project.
