@@ -287,7 +287,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  --output-dir <dir>       Output directory for plist files (default: .)");
                 eprintln!("  --debug                  Print CloudKit record-type breakdown and per-record details");
                 eprintln!("  --serve                  Run the localhost REST API instead of the CLI export");
-                eprintln!("  --port <n>               Port for --serve (default: 5301, binds 127.0.0.1 only)");
+                eprintln!("  --port <n>               Port for --serve (default: 5301)");
+                eprintln!("                           Binds 127.0.0.1 unless EXPORT_FINDMY_BIND is set");
                 eprintln!();
                 eprintln!("WARNING: Output plist files contain private key material.");
                 return Ok(());

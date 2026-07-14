@@ -71,8 +71,10 @@ For driving the export from a web UI (rather than a terminal), `--serve`
 exposes the same login → escrow → CloudKit pipeline as a small REST API. It
 holds the Apple login session open between requests so the 2FA code, device
 choice, and passcode can arrive one HTTP call at a time. The server binds
-`127.0.0.1` only and keeps all session state in memory (10-minute idle TTL);
-credentials are never written to disk or logged.
+`127.0.0.1` by default (set `EXPORT_FINDMY_BIND`, e.g. `::`, to listen on
+another interface such as a private container network) and keeps all session
+state in memory (10-minute idle TTL); credentials are never written to disk or
+logged.
 
 ```bash
 ./target/release/export-findmy --serve --port 5301
