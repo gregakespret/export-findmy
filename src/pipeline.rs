@@ -153,8 +153,16 @@ pub async fn run_export(
     let debug = opts.debug;
     let config: Arc<dyn OSConfig> = Arc::new(FakeIOSConfig::new());
 
+    // Every log line is prefixed with the Apple ID so concurrent `--serve` runs
+    // (each driving a different account) can be told apart in interleaved output.
+    macro_rules! log {
+        ($($arg:tt)*) => {
+            eprintln!("[{}] {}", opts.apple_id, format_args!($($arg)*))
+        };
+    }
+
     // ── Step 1: Create anisette client ──────────────────────────────
-    eprintln!("[1/7] Connecting to anisette server...");
+    log!("[1/7] Connecting to anisette server...");
     let anisette_config_path = PathBuf::from_str("anisette_state").unwrap();
     std::fs::create_dir_all(&anisette_config_path).ok();
 
@@ -168,7 +176,7 @@ pub async fn run_export(
         ))));
 
     // ── Step 2: Login to Apple ──────────────────────────────────────
-    eprintln!("[2/7] Logging in to Apple ID...");
+    log!("[2/7] Logging in to Apple ID...");
     let apple_id_clone = opts.apple_id.clone();
     let password_hash: Vec<u8> = Sha256::digest(opts.password.as_bytes()).to_vec();
     let appleid_closure = move || (apple_id_clone.clone(), password_hash.clone());
@@ -182,10 +190,10 @@ pub async fn run_export(
     let spd = account.spd.as_ref().expect("No SPD after login");
     let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap().to_string();
     let adsid = spd["adsid"].as_string().unwrap().to_string();
-    eprintln!("  Logged in (dsid={})", dsid);
+    log!("  Logged in (dsid={})", dsid);
 
     // ── Step 3: Get MobileMe delegate ───────────────────────────────
-    eprintln!("[3/7] Fetching MobileMe delegate...");
+    log!("[3/7] Fetching MobileMe delegate...");
     let delegates =
         login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::MobileMe])
             .await
@@ -193,10 +201,10 @@ pub async fn run_export(
     let mobileme = delegates.mobileme.expect("No MobileMe delegate returned");
 
     // ── Step 4: Create CloudKit + Keychain clients ──────────────────
-    eprintln!("[4/7] Setting up CloudKit & Keychain...");
+    log!("[4/7] Setting up CloudKit & Keychain...");
     let keychain_state = KeychainClientState::new(dsid.clone(), adsid.clone(), &mobileme)
         .unwrap_or_else(|| {
-            eprintln!("  (escrowProxyUrl not in MobileMe config, using default)");
+            log!("  (escrowProxyUrl not in MobileMe config, using default)");
             KeychainClientState::new_with_host(
                 dsid.clone(),
                 adsid.clone(),
@@ -229,7 +237,7 @@ pub async fn run_export(
     });
 
     // ── Step 5: Join iCloud Keychain circle via escrow ────────────
-    eprintln!("[5/7] Joining iCloud Keychain trust circle...");
+    log!("[5/7] Joining iCloud Keychain trust circle...");
     let all_bottles = keychain
         .get_viable_bottles()
         .await
@@ -247,9 +255,9 @@ pub async fn run_export(
         .iter()
         .map(|(_, meta)| DeviceInfo::from_metadata(&meta.serial, &meta.client_metadata))
         .collect();
-    eprintln!("  Found {} usable device(s):", devices.len());
+    log!("  Found {} usable device(s):", devices.len());
     for (i, d) in devices.iter().enumerate() {
-        eprintln!("    [{}] {} ({}) [{}]", i, d.name, d.model, d.serial);
+        log!("    [{}] {} ({}) [{}]", i, d.name, d.model, d.serial);
     }
     let bottle_idx = io.choose_bottle(&devices)?;
     if bottle_idx >= bottles.len() {
@@ -259,7 +267,7 @@ pub async fn run_export(
         )));
     }
     let (bottle, _) = &bottles[bottle_idx];
-    eprintln!("  Using device: {} [{}]", devices[bottle_idx].name, devices[bottle_idx].serial);
+    log!("  Using device: {} [{}]", devices[bottle_idx].name, devices[bottle_idx].serial);
     let passcode = io.get_passcode()?;
 
     keychain
@@ -270,10 +278,10 @@ pub async fn run_export(
                 "Joining the keychain trust circle failed (wrong passcode?): {e}"
             ))
         })?;
-    eprintln!("  Joined keychain trust circle!");
+    log!("  Joined keychain trust circle!");
 
     // ── Step 6: Fetch BeaconStore records from CloudKit ─────────────
-    eprintln!("[6/7] Fetching FindMy accessories from CloudKit...");
+    log!("[6/7] Fetching FindMy accessories from CloudKit...");
     let container = SEARCH_PARTY_CONTAINER
         .init(cloudkit.clone())
         .await
@@ -305,7 +313,7 @@ pub async fn run_export(
         .remove(0);
 
     if debug {
-        eprintln!("  [debug] total CloudKit changes returned: {}", changes.len());
+        log!("  [debug] total CloudKit changes returned: {}", changes.len());
     }
 
     for change in changes {
@@ -337,7 +345,7 @@ pub async fn run_export(
             let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some(&pcs));
             alignment_records.insert(item.beacon_identifier.clone(), (identifier, item));
         } else if debug && record_type == SharedBeaconRecord::record_type() {
-            eprintln!("  [debug] Shared beacon id={} (not exported)", identifier);
+            log!("  [debug] Shared beacon id={} (not exported)", identifier);
         }
     }
 
@@ -377,7 +385,7 @@ pub async fn run_export(
         );
     }
 
-    eprintln!("[7/7] Assembling {} accessory export(s)...", accessories.len());
+    log!("[7/7] Assembling {} accessory export(s)...", accessories.len());
     // Move the accessories (and their secret key bytes) into the exports rather
     // than cloning — accessories is dropped right after.
     Ok(accessories.into_values().map(beacon_export).collect())
