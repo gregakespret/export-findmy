@@ -328,15 +328,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Scoped so rustpush's own records carry `[sess=cli]` too, matching the
     // prefix on the pipeline's lines.
-    let beacons = logging::SESSION
-        .scope(
-            "cli".to_string(),
-            run_export(
-                ExportOpts { apple_id, password, anisette_url, debug, session_id: "cli".to_string() },
-                &CliInteract,
-            ),
-        )
-        .await?;
+    let beacons = logging::scope(
+        "cli".to_string(),
+        run_export(
+            ExportOpts { apple_id, password, anisette_url, debug, session_id: "cli".to_string() },
+            &CliInteract,
+        ),
+    )
+    .await?;
 
     // ── Write plist files ───────────────────────────────────────────
     if beacons.is_empty() {

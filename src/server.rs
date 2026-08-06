@@ -216,7 +216,7 @@ where
     // tag, so rustpush's own log records are attributable to this attempt.
     let inner = tokio::spawn({
         let interact = interact.clone();
-        crate::logging::SESSION.scope(tag(id), async move { runner(interact).await })
+        crate::logging::scope(tag(id), async move { runner(interact).await })
     });
     // Held by the Session: this, not the wrapper's handle, is what actually
     // stops the export.
@@ -561,6 +561,10 @@ fn status_for(code: &str) -> StatusCode {
     match code {
         "bad_credentials" => StatusCode::UNAUTHORIZED,
         "bad_passcode" | "bad_device_index" | "no_bottles" => StatusCode::BAD_REQUEST,
+        // Not a malformed request: the passcode was right and the input was
+        // valid. What conflicts is the state of the account's keychain trust
+        // circle, which no correction to this request can fix.
+        "trust_circle_signature" => StatusCode::CONFLICT,
         "session_not_found" => StatusCode::NOT_FOUND,
         "session_expired" => StatusCode::GONE,
         _ => StatusCode::BAD_GATEWAY,
@@ -650,6 +654,22 @@ pub async fn serve(port: u16, anisette_url: String) -> Result<(), Box<dyn std::e
 mod tests {
     use super::*;
     use tower::ServiceExt; // oneshot
+
+    #[test]
+    fn every_pipeline_code_maps_to_its_own_status() {
+        // The codes a client switches on, and the statuses that must not drift
+        // into each other — a 4xx that reads as "fix your input" is wrong for a
+        // failure the user's input cannot fix.
+        assert_eq!(status_for("bad_credentials"), StatusCode::UNAUTHORIZED);
+        assert_eq!(status_for("bad_passcode"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_for("trust_circle_signature"), StatusCode::CONFLICT);
+        assert_eq!(status_for("bad_device_index"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_for("no_bottles"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_for("session_not_found"), StatusCode::NOT_FOUND);
+        assert_eq!(status_for("session_expired"), StatusCode::GONE);
+        // Anything unrecognised is upstream's fault, not the caller's.
+        assert_eq!(status_for("apple_error"), StatusCode::BAD_GATEWAY);
+    }
 
     fn state_with(spawn: Spawner) -> AppState {
         AppState {

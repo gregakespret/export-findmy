@@ -152,8 +152,15 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (covers a wrong password *or* a wrong 2FA code — rustpush's login doesn't
-distinguish them), `bad_passcode`, `bad_device_index`, `no_bottles`,
-`wrong_step`, `session_not_found`, `session_expired`, `apple_error`.
+distinguish them), `bad_passcode`, `trust_circle_signature`, `bad_device_index`,
+`no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
+`apple_error`.
+
+`trust_circle_signature` (HTTP 409) is deliberately separate from
+`bad_passcode`: it means the escrow bottle decrypted — so the device passcode
+was correct — and the join then failed verifying one of the trust circle's
+signatures. Prompting for the passcode again cannot resolve it; the user should
+try a different trusted device. The server log names which signature failed.
 
 ## Output format
 

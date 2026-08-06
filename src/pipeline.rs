@@ -30,6 +30,7 @@ use rustpush::{
     OSConfig, PushError, TokenProvider,
 };
 
+use crate::logging;
 use crate::FakeIOSConfig;
 
 /// The serial `FakeIOSConfig` registers for this tool's own device. Every run
@@ -90,6 +91,12 @@ pub enum PipelineError {
     /// password from a bad 2FA code, so this covers both step-1/step-2 failures.
     BadCredentials(String),
     BadPasscode(String),
+    /// The trust-circle join failed a *signature* check, not the passcode. Kept
+    /// apart from `BadPasscode` because the two need opposite advice: this one
+    /// is reached only after the passcode has already unlocked the escrow
+    /// bottle, so "check your passcode" sends the user round a loop that cannot
+    /// terminate. Trying a different trusted device is the way out.
+    TrustCircleSignature(String),
     BadDeviceIndex(String),
     NoBottles,
     Apple(String),
@@ -102,6 +109,7 @@ impl PipelineError {
         match self {
             PipelineError::BadCredentials(_) => "bad_credentials",
             PipelineError::BadPasscode(_) => "bad_passcode",
+            PipelineError::TrustCircleSignature(_) => "trust_circle_signature",
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
             PipelineError::NoBottles => "no_bottles",
             PipelineError::Apple(_) => "apple_error",
@@ -117,6 +125,7 @@ impl std::fmt::Display for PipelineError {
         match self {
             PipelineError::BadCredentials(m) => write!(f, "{m}"),
             PipelineError::BadPasscode(m) => write!(f, "{m}"),
+            PipelineError::TrustCircleSignature(m) => write!(f, "{m}"),
             PipelineError::BadDeviceIndex(m) => write!(f, "{m}"),
             PipelineError::NoBottles => {
                 write!(f, "No escrow bottles found. Make sure you have another trusted device.")
@@ -376,23 +385,48 @@ pub async fn run_export(
     {
         log!("!! FAILED at [5/7] join trust circle after {:.1}s ({:.1}s in the join): {} [{:?}]",
              started.elapsed().as_secs_f32(), join_started.elapsed().as_secs_f32(), e, e);
-        // We tell the user "wrong passcode?" because that is the common case,
-        // but this call fails for several unrelated reasons and the log must not
-        // repeat the guess. `PushError::BadMsg` in particular is a *signature*
-        // verification failure inside escrow recovery (rustpush logs "Signature
-        // verification failed" at warn), reached only after the passcode has
-        // already unlocked the bottle — chasing the passcode on that one wastes
-        // the user's time. A genuinely wrong passcode fails earlier, in the SRP
-        // exchange, as an escrow/HTTP error.
+        // This call fails for several unrelated reasons and only some of them
+        // are the passcode. `PushError::BadMsg` in particular is a *signature*
+        // verification failure, reached only after the passcode has already
+        // unlocked the bottle — a genuinely wrong passcode fails earlier, in the
+        // escrow SRP exchange, as an escrow/HTTP error. So BadMsg gets its own
+        // message: telling that user to re-check their passcode sends them round
+        // a loop that cannot terminate.
+        //
+        // rustpush logs the identical "Signature verification failed" at all
+        // four sites, so which one it was comes from `logging`'s checkpoint —
+        // available here at the default log level, with no keychain contents
+        // spilled to get it. See `logging::CHECKPOINTS`.
         if matches!(e, PushError::BadMsg) {
-            // Scoped to the keychain module on purpose: `rustpush=debug` turns on
-            // `login_apple_delegates`' "Got spd {:?}", which dumps the whole SPD
-            // — every Apple service token, including the IDMS PET — into
-            // whatever hosted log store this is deployed against.
-            log!("   hint: BadMsg here is a signature check, NOT a rejected passcode — \
-                  run with RUST_LOG=rustpush::icloud::keychain=debug to see which \
-                  signature failed (do NOT widen this to rustpush=debug: that logs \
-                  Apple session tokens)");
+            let failing = match logging::last_checkpoint() {
+                Some(c) => {
+                    log!("   last keychain checkpoint: {:?}", c.prefix());
+                    c.verifies()
+                }
+                // Nothing reached: the first check in the join is the bottle's
+                // own escrowed-key signature, which rustpush verifies before the
+                // peer lookup that logs the first checkpoint.
+                None => Some("the escrow bottle's own escrowed-key signature"),
+            };
+            match failing {
+                Some(what) => log!(
+                    "   => signature check failed on {what} — NOT a rejected passcode \
+                     (the bottle had already decrypted). Try the other trusted device."
+                ),
+                // A checkpoint with no check after it. Saying which signature
+                // failed would be a guess, and the guess is the thing this
+                // whole path exists to stop.
+                None => log!(
+                    "   => BadMsg at a point with no expected signature check; \
+                     not one of the known join sites"
+                ),
+            }
+            return Err(PipelineError::TrustCircleSignature(format!(
+                "Joining the keychain trust circle failed a signature check on {}. \
+                 This is not a wrong passcode — the device passcode already worked. \
+                 Try connecting with a different trusted device.",
+                failing.unwrap_or("an unidentified signature")
+            )));
         }
         return Err(PipelineError::BadPasscode(format!(
             "Joining the keychain trust circle failed (wrong passcode?): {e}"
@@ -672,6 +706,13 @@ mod tests {
     fn pipeline_error_codes_and_messages() {
         assert_eq!(PipelineError::BadCredentials("x".into()).code(), "bad_credentials");
         assert_eq!(PipelineError::BadPasscode("x".into()).code(), "bad_passcode");
+        // Distinct from bad_passcode on purpose: a client that tells the user to
+        // re-enter their passcode here would be telling them to retry the one
+        // thing that already worked.
+        assert_eq!(
+            PipelineError::TrustCircleSignature("x".into()).code(),
+            "trust_circle_signature"
+        );
         assert_eq!(PipelineError::BadDeviceIndex("x".into()).code(), "bad_device_index");
         assert_eq!(PipelineError::NoBottles.code(), "no_bottles");
         assert_eq!(PipelineError::Apple("x".into()).code(), "apple_error");
