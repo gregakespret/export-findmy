@@ -171,6 +171,14 @@ impl Interact for CliInteract {
         eprint!("  Enter the passcode of that device: ");
         Ok(read_password())
     }
+
+    fn join_retryable(&self, _error: &'static str, detail: &str) {
+        // Without this the next prompt would appear with no explanation, and
+        // the user would assume they had mistyped the passcode — the one thing
+        // this error means they did not do.
+        eprintln!("  {detail}");
+        eprintln!("  Pick a different device and try again.");
+    }
 }
 
 // ── Password reading ────────────────────────────────────────────────────
