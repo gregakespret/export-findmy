@@ -219,7 +219,16 @@ fn arg_err(flag: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    pretty_env_logger::init();
+    // rustpush logs the *reason* behind several of the opaque errors we surface
+    // — "Signature verification failed" is what stands behind the "Bad message"
+    // a user sees — but only through the `log` crate. With RUST_LOG unset,
+    // env_logger's filter is off and every one of those lines is dropped, which
+    // is why a failed export used to explain nothing. Default to warn so the
+    // reason is on the record without redeploying with a new env var; RUST_LOG
+    // still overrides (RUST_LOG=rustpush=debug for a deep dive).
+    pretty_env_logger::formatted_builder()
+        .parse_filters(&std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string()))
+        .init();
 
     init_keystore(SoftwareKeystore {
         state: plist::from_file("keystore.plist").unwrap_or_default(),
@@ -317,7 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&output_dir)?;
 
     let beacons = run_export(
-        ExportOpts { apple_id, password, anisette_url, debug },
+        ExportOpts { apple_id, password, anisette_url, debug, session_id: "cli".to_string() },
         &CliInteract,
     )
     .await?;
