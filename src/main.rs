@@ -1,3 +1,4 @@
+mod logging;
 mod pipeline;
 mod server;
 
@@ -219,7 +220,16 @@ fn arg_err(flag: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    pretty_env_logger::init();
+    // rustpush logs the *reason* behind several of the opaque errors we surface
+    // — "Signature verification failed" is what stands behind the "Bad message"
+    // a user sees — but only through the `log` crate, and with RUST_LOG unset
+    // env_logger keeps just `error`, so those `warn`s were dropped and a failed
+    // export explained nothing. See `logging` for the default filter and for the
+    // session tag stamped onto rustpush's records.
+    let filter = logging::init();
+    // Which filter is actually in force: "the log says nothing" is otherwise
+    // indistinguishable from "the log was filtered down to nothing".
+    log::info!("log filter: {filter}");
 
     init_keystore(SoftwareKeystore {
         state: plist::from_file("keystore.plist").unwrap_or_default(),
@@ -316,11 +326,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::fs::create_dir_all(&output_dir)?;
 
-    let beacons = run_export(
-        ExportOpts { apple_id, password, anisette_url, debug },
-        &CliInteract,
-    )
-    .await?;
+    // Scoped so rustpush's own records carry `[sess=cli]` too, matching the
+    // prefix on the pipeline's lines.
+    let beacons = logging::SESSION
+        .scope(
+            "cli".to_string(),
+            run_export(
+                ExportOpts { apple_id, password, anisette_url, debug, session_id: "cli".to_string() },
+                &CliInteract,
+            ),
+        )
+        .await?;
 
     // ── Write plist files ───────────────────────────────────────────
     if beacons.is_empty() {
