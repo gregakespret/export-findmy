@@ -118,7 +118,22 @@ phone passcode was wanted, from a real Apple rejection.
 
 `RUST_LOG` controls rustpush's own logging, which carries the reason behind
 several of the opaque errors above (`Signature verification failed` for
-`BadMsg`). It defaults to `warn`; use `RUST_LOG=rustpush=debug` for a deep dive.
+`BadMsg`). Those records are stamped with the same `[sess=…]` tag as the lines
+around them, so a warning can be tied to the attempt that produced it even with
+two exports in flight:
+
+```
+[sess=3f2a1b8c] WARN  rustpush::icloud::keychain > Signature verification failed
+```
+
+It defaults to `warn,export_findmy=info`; an empty `RUST_LOG` counts as unset
+(a cleared-but-present env var would otherwise silence everything). The filter
+in force is logged at startup.
+
+For a deep dive use `RUST_LOG=rustpush::icloud::keychain=debug`. **Do not widen
+that to `rustpush=debug` on a deployed instance:** rustpush debug-logs the whole
+SPD after login, which contains every Apple service token for the session,
+including the IDMS PET.
 
 When Apple already trusts the session (a recent successful login from the same
 anisette identity), the login skips 2FA — then `POST /sessions` returns

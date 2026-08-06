@@ -24,6 +24,12 @@ use crate::pipeline::{run_export, BeaconExport, DeviceInfo, ExportOpts, Interact
 
 const INPUT_TIMEOUT: Duration = Duration::from_secs(600); // pipeline waits on the user
 const SESSION_TTL: Duration = Duration::from_secs(600);
+/// How long a handler waits on Apple for the next step. Named so the log lines
+/// that quote them read from the same place the wait does — a prose "180s" beside
+/// a separate literal states a duration that never elapsed the moment either moves.
+const START_TIMEOUT: Duration = Duration::from_secs(180);
+/// The escrow join plus the CloudKit sync, which can legitimately take minutes.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Short form of a session id, used as the log tag on both sides of the wire:
 /// the pipeline prefixes its lines with it and the caller records the full id,
@@ -102,7 +108,12 @@ pub struct Session {
     pub step_rx: watch::Receiver<Step>,
     pub tfa_tx: Sender<String>,
     pub escrow_tx: Sender<(usize, String)>,
-    pub task: tokio::task::JoinHandle<()>,
+    /// Cancels the *pipeline* task, not the wrapper that awaits it. Aborting the
+    /// wrapper would only drop its future — and dropping a `JoinHandle` detaches
+    /// the task in tokio rather than cancelling it, so the export would carry on
+    /// talking to Apple, holding extracted key material, for a session we had
+    /// already told the user was dead.
+    pub abort: tokio::task::AbortHandle,
     pub last_touch: StdMutex<Instant>,
 }
 
@@ -144,6 +155,11 @@ impl Interact for ServerInteract {
             PipelineError::Aborted
         })?;
         if idx >= devices.len() {
+            // This check, not the pipeline's identical one, is the one that
+            // fires in server mode — so without this line a rejected index
+            // leaves no record of what the client actually sent.
+            slog!(self.id, "device_index {} out of range 0-{} — rejecting",
+                  idx, devices.len().saturating_sub(1));
             return Err(PipelineError::BadDeviceIndex(format!(
                 "Invalid device index {idx}. Must be 0-{}.",
                 devices.len().saturating_sub(1)
@@ -162,7 +178,9 @@ impl Interact for ServerInteract {
 /// How `create_session` turns login options into a running session task. In
 /// production this is `spawn_session` (the real pipeline); tests inject a
 /// scripted spawner so the HTTP handlers can be driven end-to-end without Apple.
-type Spawner = Arc<dyn Fn(ExportOpts) -> (Uuid, Arc<Session>) + Send + Sync>;
+/// The id is minted by the caller and passed in, so the tag stamped into
+/// `ExportOpts::session_id` and the id returned to the client cannot drift apart.
+type Spawner = Arc<dyn Fn(Uuid, ExportOpts) -> Arc<Session> + Send + Sync>;
 
 #[derive(Clone)]
 struct AppState {
@@ -175,14 +193,11 @@ struct AppState {
 /// Spawn a session task driven by an arbitrary async runner. `spawn_session`
 /// uses the real pipeline; tests inject a scripted runner over the same
 /// [`ServerInteract`], so the channel/step plumbing is exercised without Apple.
-pub fn spawn_session_with<F, Fut>(runner: F) -> (Uuid, Arc<Session>)
+pub fn spawn_session_with<F, Fut>(id: Uuid, runner: F) -> Arc<Session>
 where
-    F: FnOnce(Uuid, Arc<ServerInteract>) -> Fut + Send + 'static,
+    F: FnOnce(Arc<ServerInteract>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<Vec<BeaconExport>, PipelineError>> + Send + 'static,
 {
-    // The id exists before the task so the pipeline's own lines can carry it —
-    // otherwise its output and the server's could not be joined for one attempt.
-    let id = Uuid::new_v4();
     let (step_tx, step_rx) = watch::channel(Step::Starting);
     let (tfa_tx, tfa_rx) = std::sync::mpsc::channel();
     let (escrow_tx, escrow_rx) = std::sync::mpsc::channel();
@@ -193,18 +208,22 @@ where
         escrow_rx: StdMutex::new(escrow_rx),
         passcode: StdMutex::new(None),
     });
-    let task = tokio::spawn({
+    let started = Instant::now();
+    // Run the pipeline on its own task so a panic (e.g. an unwrap on unexpected
+    // Apple/CloudKit data) becomes a JoinError the wrapper below can turn into
+    // Failed — otherwise the panic unwinds past the step publish and every
+    // waiting handler hangs to its timeout. The task also carries the session
+    // tag, so rustpush's own log records are attributable to this attempt.
+    let inner = tokio::spawn({
+        let interact = interact.clone();
+        crate::logging::SESSION.scope(tag(id), async move { runner(interact).await })
+    });
+    // Held by the Session: this, not the wrapper's handle, is what actually
+    // stops the export.
+    let abort = inner.abort_handle();
+    tokio::spawn({
         let interact = interact.clone();
         async move {
-            let started = Instant::now();
-            // Run the pipeline on an inner task so a panic (e.g. an unwrap on
-            // unexpected Apple/CloudKit data) becomes a JoinError we can turn
-            // into Failed — otherwise the panic unwinds past the step publish
-            // and every waiting handler hangs to its timeout.
-            let inner = tokio::spawn({
-                let interact = interact.clone();
-                async move { runner(id, interact).await }
-            });
             let final_step = match inner.await {
                 Ok(Ok(beacons)) => {
                     slog!(id, "export finished: {} beacon(s) in {:.1}s",
@@ -231,20 +250,17 @@ where
             let _ = interact.step_tx.send(final_step);
         }
     });
-    let session = Arc::new(Session {
+    Arc::new(Session {
         step_rx,
         tfa_tx,
         escrow_tx,
-        task,
+        abort,
         last_touch: StdMutex::new(Instant::now()),
-    });
-    (id, session)
+    })
 }
 
-fn spawn_session(opts: ExportOpts) -> (Uuid, Arc<Session>) {
-    spawn_session_with(move |id, io| async move {
-        run_export(ExportOpts { session_id: tag(id), ..opts }, io.as_ref()).await
-    })
+fn spawn_session(id: Uuid, opts: ExportOpts) -> Arc<Session> {
+    spawn_session_with(id, move |io| async move { run_export(opts, io.as_ref()).await })
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -271,39 +287,45 @@ async fn healthz() -> Response {
 }
 
 async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>) -> Response {
+    // Minted here, not inside the spawner, so the tag the pipeline logs and the
+    // id the client is handed come from one value — the cross-log join rests on
+    // them being the same and nothing downstream can make them differ.
+    let id = Uuid::new_v4();
     let opts = ExportOpts {
         apple_id: body.apple_id,
         password: body.password,
         anisette_url: (*st.anisette_url).clone(),
         debug: false,
-        // Stamped by the spawner, which is what mints the session id.
-        session_id: String::new(),
+        session_id: tag(id),
     };
-    let (id, session) = (st.spawn)(opts);
-    slog!(id, "POST /sessions: new attempt (live sessions: {})",
-          st.sessions.lock().await.len() + 1);
+    let session = (st.spawn)(id, opts);
     // Track the session BEFORE waiting so that if the client disconnects during
     // the wait (dropping this handler), the task is still reachable by the reaper
     // rather than orphaned.
-    st.sessions.lock().await.insert(id, session.clone());
+    let live = {
+        let mut sessions = st.sessions.lock().await;
+        sessions.insert(id, session.clone());
+        // Counted after the insert, under the same lock: `len() + 1` beforehand
+        // is a guess that two simultaneous creates make wrong.
+        sessions.len()
+    };
+    slog!(id, "POST /sessions: new attempt (live sessions: {})", live);
     // Wait until login has decided what's next: a 2FA challenge, or — if Apple
     // already trusts this session and skips 2FA — straight to device selection.
     // (Login → the device list can take a bit, so allow a generous window.)
     let mut rx = session.step_rx.clone();
-    let outcome = wait_for(&mut rx, Duration::from_secs(180), |s| {
-        !matches!(s, Step::Starting)
-    })
-    .await;
+    let outcome = wait_for(&mut rx, START_TIMEOUT, |s| !matches!(s, Step::Starting)).await;
     match &outcome {
         Some(s) => slog!(id, "POST /sessions -> {}", step_name(s)),
         // A timeout here is reported to the user as "Timed out contacting
         // Apple", which reads like an Apple fault even when login is merely
         // slow; the log says how long we actually waited.
-        None => slog!(id, "POST /sessions: still starting after 180s — giving up"),
+        None => slog!(id, "POST /sessions: still starting after {}s — giving up",
+                      START_TIMEOUT.as_secs()),
     }
     let (keep, status, body) = start_outcome(id, outcome);
     if !keep {
-        session.task.abort();
+        session.abort.abort();
         retire(&st, id).await;
     }
     (status, Json(body)).into_response()
@@ -347,17 +369,24 @@ async fn submit_2fa(
     // Reject an out-of-order post: the code channel is only drained at
     // AwaitingTfa, so sending now would buffer a value that's consumed
     // sight-unseen later (or never).
-    let current = step_name(&session.step_rx.borrow());
+    // One borrow feeds both the log and the guard. Taken separately, the
+    // pipeline can publish a transition in between and the rejection line names
+    // a step that isn't the one that caused it ("at awaiting_2fa, not
+    // awaiting_2fa") — a self-contradiction in the record meant to settle it.
+    let (current, ready) = {
+        let step = session.step_rx.borrow();
+        (step_name(&step), matches!(&*step, Step::AwaitingTfa))
+    };
     // Never the code itself; its length is what tells an empty submit from a
     // mistyped one, and both reach Apple as the same rejection.
-    slog!(id, "POST /2fa: code {} chars, session at {}", body.code.len(), current);
-    if !matches!(&*session.step_rx.borrow(), Step::AwaitingTfa) {
+    slog!(id, "POST /2fa: code {} chars, session at {}", body.code.chars().count(), current);
+    if !ready {
         slog!(id, "POST /2fa rejected: session is at {}, not awaiting_2fa", current);
         return wrong_step();
     }
     let _ = session.tfa_tx.send(body.code);
     let mut rx = session.step_rx.clone();
-    match wait_for(&mut rx, Duration::from_secs(180), |s| !matches!(s, Step::AwaitingTfa)).await {
+    match wait_for(&mut rx, START_TIMEOUT, |s| !matches!(s, Step::AwaitingTfa)).await {
         Some(Step::AwaitingEscrow { devices }) => {
             slog!(id, "POST /2fa -> awaiting_passcode with {} device(s)", devices.len());
             (StatusCode::OK, Json(json!({"state": "awaiting_passcode", "devices": devices})))
@@ -368,9 +397,20 @@ async fn submit_2fa(
             retire(&st, id).await;
             error_response(error, detail)
         }
-        _ => {
-            slog!(id, "POST /2fa: no answer from Apple within 180s — aborting the attempt");
-            session.task.abort();
+        // `wait_for` returns None on a timeout *or* a dropped sender, and Some
+        // for any other step — reporting all of them as a 180s timeout asserts
+        // a cause this branch hasn't established.
+        None => {
+            slog!(id, "POST /2fa: no answer from Apple within {}s — aborting the attempt",
+                  START_TIMEOUT.as_secs());
+            session.abort.abort();
+            retire(&st, id).await;
+            error_response("apple_error", "Timed out waiting for Apple.".into())
+        }
+        Some(other) => {
+            slog!(id, "POST /2fa: left awaiting_2fa for {} — aborting the attempt",
+                  step_name(&other));
+            session.abort.abort();
             retire(&st, id).await;
             error_response("apple_error", "Timed out waiting for Apple.".into())
         }
@@ -389,18 +429,21 @@ async fn submit_escrow(
     // Reject an out-of-order post (e.g. /escrow before /2fa): sending now would
     // buffer a (device_index, passcode) tuple that choose_bottle later consumes
     // against a device the user never saw — burning an Apple escrow attempt.
-    let current = step_name(&session.step_rx.borrow());
+    // One borrow for both the log and the guard — see the note in `submit_2fa`.
+    let (current, ready) = {
+        let step = session.step_rx.borrow();
+        (step_name(&step), matches!(&*step, Step::AwaitingEscrow { .. }))
+    };
     slog!(id, "POST /escrow: device_index={} passcode {} chars, session at {}",
-          body.device_index, body.passcode.len(), current);
-    if !matches!(&*session.step_rx.borrow(), Step::AwaitingEscrow { .. }) {
+          body.device_index, body.passcode.chars().count(), current);
+    if !ready {
         slog!(id, "POST /escrow rejected: session is at {}, not awaiting_passcode", current);
         return wrong_step();
     }
     let escrow_started = Instant::now();
     let _ = session.escrow_tx.send((body.device_index, body.passcode));
     let mut rx = session.step_rx.clone();
-    // The escrow join + CloudKit sync can take a while.
-    let done = wait_for(&mut rx, Duration::from_secs(900), |s| {
+    let done = wait_for(&mut rx, EXPORT_TIMEOUT, |s| {
         matches!(s, Step::Done { .. } | Step::Failed { .. })
     })
     .await;
@@ -419,11 +462,11 @@ async fn submit_escrow(
             error_response(error, detail)
         }
         _ => {
-            slog!(id, "POST /escrow: still running after 900s — aborting (extraction \
-                   never completed; the user sees an Apple timeout)");
-            // Still running past our budget — abort so the task doesn't keep
+            slog!(id, "POST /escrow: still running after {}s — aborting (extraction \
+                   never completed; the user sees an Apple timeout)", EXPORT_TIMEOUT.as_secs());
+            // Still running past our budget — abort so the pipeline doesn't keep
             // running (holding extracted keys) with no one able to reach it.
-            session.task.abort();
+            session.abort.abort();
             retire(&st, id).await;
             error_response("apple_error", "Timed out waiting for Apple.".into())
         }
@@ -445,7 +488,12 @@ async fn touch(st: &AppState, id: Uuid) -> Result<Arc<Session>, Response> {
         slog!(id, "request for an expired session -> 410");
         return Err(error_response("session_expired", "This connection attempt expired.".into()));
     }
-    slog!(id, "request for an unknown session -> 404 (restart, or never ours)");
+    // Debug, not info: this is reachable by anyone who can reach the service
+    // (on Railway's private network, any co-tenant), it carries no Apple ID, and
+    // by construction it names a session this process has no other record of —
+    // so it can never be joined to a user, and a client retry loop after a
+    // redeploy would otherwise pour unbounded volume into the hosted log store.
+    log::debug!("[sess={}] request for an unknown session -> 404 (restart, or never ours)", tag(id));
     Err(error_response("session_not_found", "Unknown connection attempt.".into()))
 }
 
@@ -573,7 +621,7 @@ async fn reap_loop(st: AppState) {
                 slog!(id, "reaped: idle {:.0}s at {} (TTL {}s)",
                       s.last_touch.lock().unwrap().elapsed().as_secs_f32(),
                       step_name(&s.step_rx.borrow()), SESSION_TTL.as_secs());
-                s.task.abort();
+                s.abort.abort();
             }
             expired.insert(id);
         }
@@ -585,7 +633,7 @@ pub async fn serve(port: u16, anisette_url: String) -> Result<(), Box<dyn std::e
         sessions: Arc::new(Mutex::new(HashMap::new())),
         expired: Arc::new(Mutex::new(HashSet::new())),
         anisette_url: Arc::new(anisette_url),
-        spawn: Arc::new(|opts| spawn_session(opts)),
+        spawn: Arc::new(spawn_session),
     };
     tokio::spawn(reap_loop(state.clone()));
     // Default to loopback so the security posture is unchanged for local use.
@@ -615,13 +663,13 @@ mod tests {
     /// State whose spawner panics if used — for handler tests that never hit
     /// POST /sessions (healthz, unknown-session).
     fn test_state() -> AppState {
-        state_with(Arc::new(|_| panic!("spawn should not be called in this test")))
+        state_with(Arc::new(|_, _| panic!("spawn should not be called in this test")))
     }
 
     /// Scripted spawner: normal 2FA flow → two devices → one beacon on Done.
     fn spawn_normal() -> Spawner {
-        Arc::new(|_opts| {
-            spawn_session_with(|_id, io| async move {
+        Arc::new(|id, _opts| {
+            spawn_session_with(id, |io| async move {
                 let _code = io.get_2fa_code(); // parks until POST /2fa
                 let idx =
                     io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
@@ -634,8 +682,8 @@ mod tests {
 
     /// Scripted spawner: 2FA skipped → straight to device selection.
     fn spawn_skip_2fa() -> Spawner {
-        Arc::new(|_opts| {
-            spawn_session_with(|_id, io| async move {
+        Arc::new(|id, _opts| {
+            spawn_session_with(id, |io| async move {
                 let _idx = io.choose_bottle(&[test_device("GYK3003QMY")])?;
                 let _pass = io.get_passcode()?;
                 Ok(vec![sample_beacon()])
@@ -645,8 +693,8 @@ mod tests {
 
     /// Scripted spawner: login fails before 2FA.
     fn spawn_err(mk: fn() -> PipelineError) -> Spawner {
-        Arc::new(move |_opts| {
-            spawn_session_with(move |_id, _io| async move {
+        Arc::new(move |id, _opts| {
+            spawn_session_with(id, move |_io| async move {
                 Err::<Vec<BeaconExport>, PipelineError>(mk())
             })
         })
@@ -788,7 +836,8 @@ mod tests {
     async fn full_scripted_session_reaches_done() {
         // A scripted runner drives the REAL ServerInteract, so the channel +
         // step-machine wiring is tested without touching Apple.
-        let (id, session) = spawn_session_with(|_id, io| async move {
+        let id = Uuid::new_v4();
+        let session = spawn_session_with(id, |io| async move {
             let code = io.get_2fa_code();
             assert_eq!(code, "123456");
             let idx = io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
@@ -829,7 +878,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bad_device_index_fails_the_session() {
-        let (_id, session) = spawn_session_with(|_id, io| async move {
+        let session = spawn_session_with(Uuid::new_v4(), |io| async move {
             io.get_2fa_code();
             let idx = io.choose_bottle(&[test_device("only")])?; // index 5 is out of range
             let _ = io.get_passcode()?;
@@ -894,7 +943,7 @@ mod tests {
         // never calls get_2fa_code, so the step goes Starting -> AwaitingEscrow
         // directly and never becomes AwaitingTfa. This is what lets POST /sessions
         // report `awaiting_passcode` and the wizard skip the 2FA screen.
-        let (_id, session) = spawn_session_with(|_id, io| async move {
+        let session = spawn_session_with(Uuid::new_v4(), |io| async move {
             let idx = io.choose_bottle(&[test_device("GYK3003QMY")])?;
             assert_eq!(idx, 0);
             let _ = io.get_passcode()?;
@@ -936,6 +985,53 @@ mod tests {
         // Session is gone after Done.
         let (s4, _) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"x"}"#).await;
         assert_eq!(s4, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_stamps_the_tag_the_caller_can_grep_for() {
+        // The whole cross-log join rests on the pipeline logging the same tag
+        // the caller stores. Nothing else drives that stamping — the tag test
+        // above checks `tag()` in isolation — so a refactor that dropped it
+        // would leave `[sess=]` on every pipeline line and still pass green.
+        let stamped: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let captured = stamped.clone();
+        let st = state_with(Arc::new(move |id, opts: ExportOpts| {
+            *captured.lock().unwrap() = Some(opts.session_id.clone());
+            spawn_session_with(id, |io| async move {
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let session_id = b["session_id"].as_str().expect("session_id returned");
+        let stamped = stamped.lock().unwrap().clone().expect("spawner saw opts");
+        assert_eq!(stamped.len(), 8);
+        assert!(session_id.starts_with(&stamped), "{session_id} should start with {stamped}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_stops_the_pipeline_not_just_the_wrapper() {
+        // Aborting the wrapper task would only DROP the pipeline's JoinHandle,
+        // which detaches it in tokio rather than cancelling it — the export would
+        // keep talking to Apple, holding extracted keys, for a session already
+        // reported dead. The flag proves the pipeline itself stopped.
+        let ran_on = Arc::new(StdMutex::new(false));
+        let flag = ran_on.clone();
+        let session = spawn_session_with(Uuid::new_v4(), move |_io| async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            *flag.lock().unwrap() = true; // only reached if the abort didn't land
+            Ok(vec![sample_beacon()])
+        });
+
+        session.abort.abort();
+        // Past the sleep the pipeline would have needed to set the flag.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!*ran_on.lock().unwrap(), "aborted pipeline kept running");
+        // The wrapper still publishes the cancellation, so waiting handlers are
+        // released instead of hanging to their timeout.
+        assert!(matches!(&*session.step_rx.borrow(), Step::Failed { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

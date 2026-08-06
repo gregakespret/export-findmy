@@ -890,6 +890,7 @@ dependencies = [
  "icloud_auth",
  "keystore",
  "libc",
+ "log",
  "omnisette",
  "plist",
  "pretty_env_logger",

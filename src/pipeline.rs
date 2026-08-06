@@ -160,12 +160,18 @@ pub async fn run_export(
     let config: Arc<dyn OSConfig> = Arc::new(FakeIOSConfig::new());
     let started = std::time::Instant::now();
 
+    // `apple_id` arrives unvalidated from the caller's JSON body. Interpolated
+    // raw, a newline in it forges a whole log record — including one carrying
+    // another session's tag, which poisons exactly the cross-log join these
+    // lines exist to support.
+    let apple_id = sanitize(&opts.apple_id);
+
     // Every log line is prefixed with the Apple ID and the run's session tag so
     // concurrent `--serve` runs — including two attempts by the same account —
     // can be told apart in interleaved output.
     macro_rules! log {
         ($($arg:tt)*) => {
-            eprintln!("[{}] [sess={}] {}", opts.apple_id, opts.session_id, format_args!($($arg)*))
+            eprintln!("[{}] [sess={}] {}", apple_id, opts.session_id, format_args!($($arg)*))
         };
     }
 
@@ -182,6 +188,15 @@ pub async fn run_export(
             let e = $e;
             log!("!! FAILED at {} after {:.1}s: {} [{:?}]", $step, started.elapsed().as_secs_f32(), e, e);
             $variant(format!(concat!($msg, ": {}"), e))
+        }};
+        // No underlying error — a response that is simply missing a field we
+        // need. The `{:?}` form above earns its place only for a rustpush error
+        // whose variant name it reveals; for a message we wrote ourselves it
+        // would just print the same words twice, in the log and in the API's
+        // `detail`.
+        ($step:expr, $variant:path, $msg:literal) => {{
+            log!("!! FAILED at {} after {:.1}s: {}", $step, started.elapsed().as_secs_f32(), $msg);
+            $variant($msg.to_string())
         }};
     }
 
@@ -220,19 +235,25 @@ pub async fn run_export(
     // task, which the server can only report as "failed unexpectedly" with no
     // attribution. A login that returns no SPD is a real (if rare) Apple
     // response, so it gets a logged, attributable failure like any other.
+    // `spd["DsPrsId"]` would be the same panic by another route — plist's
+    // `Dictionary` indexes through `IndexMap`, which panics on an absent key
+    // (rustpush's own code writes `.expect("no dsid???")` there, so a missing
+    // key is the expected failure, not an impossible one) — hence `get`.
     let spd = account.spd.as_ref().ok_or_else(|| {
-        step_failed!("[2/7] login", PipelineError::Apple, "No SPD after login", "missing spd")
+        step_failed!("[2/7] login", PipelineError::Apple, "No SPD after login")
     })?;
-    let dsid = spd["DsPrsId"]
-        .as_unsigned_integer()
+    let dsid = spd
+        .get("DsPrsId")
+        .and_then(|v| v.as_unsigned_integer())
         .ok_or_else(|| {
-            step_failed!("[2/7] login", PipelineError::Apple, "No DsPrsId in SPD", "missing DsPrsId")
+            step_failed!("[2/7] login", PipelineError::Apple, "No DsPrsId in SPD")
         })?
         .to_string();
-    let adsid = spd["adsid"]
-        .as_string()
+    let adsid = spd
+        .get("adsid")
+        .and_then(|v| v.as_string())
         .ok_or_else(|| {
-            step_failed!("[2/7] login", PipelineError::Apple, "No adsid in SPD", "missing adsid")
+            step_failed!("[2/7] login", PipelineError::Apple, "No adsid in SPD")
         })?
         .to_string();
     log!("  Logged in (dsid={}) after {:.1}s", dsid, started.elapsed().as_secs_f32());
@@ -246,8 +267,7 @@ pub async fn run_export(
                 step_failed!("[3/7] MobileMe delegate", PipelineError::Apple, "MobileMe delegate failed", e)
             })?;
     let mobileme = delegates.mobileme.ok_or_else(|| {
-        step_failed!("[3/7] MobileMe delegate", PipelineError::Apple,
-                     "No MobileMe delegate returned", "delegate absent")
+        step_failed!("[3/7] MobileMe delegate", PipelineError::Apple, "No MobileMe delegate returned")
     })?;
 
     // ── Step 4: Create CloudKit + Keychain clients ──────────────────
@@ -267,8 +287,7 @@ pub async fn run_export(
     token_provider.set_mme_delegate(mobileme).await;
 
     let cloudkit_state = CloudKitState::new(dsid.clone()).ok_or_else(|| {
-        step_failed!("[4/7] CloudKit setup", PipelineError::Apple,
-                     "Failed to create CloudKitState", "state unavailable")
+        step_failed!("[4/7] CloudKit setup", PipelineError::Apple, "Failed to create CloudKitState")
     })?;
     let cloudkit = Arc::new(CloudKitClient {
         state: DebugRwLock::new(cloudkit_state),
@@ -319,7 +338,10 @@ pub async fn run_export(
         .collect();
     log!("  Found {} usable device(s):", devices.len());
     for (i, d) in devices.iter().enumerate() {
-        log!("    [{}] {} ({}) [{}]", i, d.name, d.model, d.serial);
+        // Device names come from Apple, i.e. from whatever the user typed into
+        // Settings — the same forged-record hole as `apple_id`, from the other
+        // direction.
+        log!("    [{}] {} ({}) [{}]", i, sanitize(&d.name), sanitize(&d.model), sanitize(&d.serial));
     }
     let bottle_idx = io.choose_bottle(&devices).inspect_err(|e| {
         log!("!! FAILED at [5/7] device choice after {:.1}s: {} [{:?}]",
@@ -340,10 +362,12 @@ pub async fn run_export(
     })?;
     // The passcode's length, never the passcode: a Mac wants its login password
     // while a phone wants 4/6 digits, and the commonest support case is someone
-    // typing the wrong one of those for the device they picked.
+    // typing the wrong one of those for the device they picked. Characters, not
+    // `len()`'s UTF-8 bytes — an accented Mac password would otherwise report a
+    // length the user never typed, undercutting the one thing the line is for.
     log!("  Using device [{}]: {} ({}) [{}], passcode {} chars",
-         bottle_idx, devices[bottle_idx].name, devices[bottle_idx].model,
-         devices[bottle_idx].serial, passcode.len());
+         bottle_idx, sanitize(&devices[bottle_idx].name), sanitize(&devices[bottle_idx].model),
+         sanitize(&devices[bottle_idx].serial), passcode.chars().count());
 
     let join_started = std::time::Instant::now();
     if let Err(e) = keychain
@@ -361,8 +385,14 @@ pub async fn run_export(
         // the user's time. A genuinely wrong passcode fails earlier, in the SRP
         // exchange, as an escrow/HTTP error.
         if matches!(e, PushError::BadMsg) {
+            // Scoped to the keychain module on purpose: `rustpush=debug` turns on
+            // `login_apple_delegates`' "Got spd {:?}", which dumps the whole SPD
+            // — every Apple service token, including the IDMS PET — into
+            // whatever hosted log store this is deployed against.
             log!("   hint: BadMsg here is a signature check, NOT a rejected passcode — \
-                  run with RUST_LOG=rustpush=debug to see which signature failed");
+                  run with RUST_LOG=rustpush::icloud::keychain=debug to see which \
+                  signature failed (do NOT widen this to rustpush=debug: that logs \
+                  Apple session tokens)");
         }
         return Err(PipelineError::BadPasscode(format!(
             "Joining the keychain trust circle failed (wrong passcode?): {e}"
@@ -407,26 +437,44 @@ pub async fn run_export(
         .await;
     }
 
-    let (_, changes, _) = result
-        .map_err(|e| {
-            step_failed!("[6/7] CloudKit fetch", PipelineError::Apple, "CloudKit fetch failed", e)
-        })?
-        .remove(0);
+    // `.remove(0)` and the per-change field accesses below were unwraps on data
+    // Apple controls — the least predictable input in the whole pipeline, and
+    // the panic source `spawn_session_with` names when it explains why the
+    // pipeline runs on its own task. A panic here reaches the user as "The
+    // export failed unexpectedly." with no step attribution at all, which is
+    // the failure class this instrumentation exists to remove.
+    let mut zones = result.map_err(|e| {
+        step_failed!("[6/7] CloudKit fetch", PipelineError::Apple, "CloudKit fetch failed", e)
+    })?;
+    if zones.is_empty() {
+        return Err(step_failed!("[6/7] CloudKit fetch", PipelineError::Apple,
+                                "CloudKit returned no BeaconStore zone"));
+    }
+    let (_, changes, _) = zones.remove(0);
 
     log!("  CloudKit returned {} change(s)", changes.len());
 
+    let mut skipped = 0usize;
     for change in changes {
-        let identifier = change
+        // A single malformed change must not kill an otherwise good export, but
+        // it must not vanish either: the count below is what says whether a
+        // short export is Apple's doing or ours.
+        let Some(identifier) = change
             .identifier
             .as_ref()
-            .unwrap()
-            .value
-            .as_ref()
-            .unwrap()
-            .name()
-            .to_string();
+            .and_then(|i| i.value.as_ref())
+            .map(|v| v.name().to_string())
+        else {
+            log!("  skipping a change with no record identifier");
+            skipped += 1;
+            continue;
+        };
         let Some(record) = change.record else { continue };
-        let record_type = record.r#type.as_ref().unwrap().name().to_string();
+        let Some(record_type) = record.r#type.as_ref().map(|t| t.name().to_string()) else {
+            log!("  skipping change {}: record has no type", sanitize(&identifier));
+            skipped += 1;
+            continue;
+        };
 
         if record_type == MasterBeaconRecord::record_type() {
             let pcs = pcs_keys_for_record(&record, &key)
@@ -450,8 +498,11 @@ pub async fn run_export(
             let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some(&pcs));
             alignment_records.insert(item.beacon_identifier.clone(), (identifier, item));
         } else if debug && record_type == SharedBeaconRecord::record_type() {
-            log!("  [debug] Shared beacon id={} (not exported)", identifier);
+            log!("  [debug] Shared beacon id={} (not exported)", sanitize(&identifier));
         }
+    }
+    if skipped > 0 {
+        log!("  Skipped {} malformed change(s) from CloudKit", skipped);
     }
 
     // An export that "succeeds" with nothing in it is the hardest failure to
@@ -524,6 +575,15 @@ fn beacon_export(acc: BeaconAccessory) -> BeaconExport {
     }
 }
 
+/// Strip control characters from anything interpolated into a log line. The
+/// Apple ID comes straight from the caller's JSON body and device names come
+/// from Apple; a newline in either ends the current record and starts one the
+/// attacker writes, which is enough to forge a `[sess=…]`-tagged success line
+/// for somebody else's attempt.
+fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()
+}
+
 /// Whole-second RFC3339 (`2026-01-11T19:57:42Z`). Apple's plist parser and
 /// `datetime.fromisoformat` both reject the nanosecond precision CloudKit carries.
 fn rfc3339_secs(t: SystemTime) -> String {
@@ -582,6 +642,30 @@ mod tests {
         let t = UNIX_EPOCH + Duration::from_nanos(1_736_625_462_920_991_898);
         let s = rfc3339_secs(t);
         assert!(!s.contains('.') && s.ends_with('Z'), "no fractional seconds: {s}");
+    }
+
+    #[test]
+    fn sanitize_stops_a_caller_forging_a_log_record() {
+        // The Apple ID is caller-supplied. A newline in it would close our line
+        // and open one attributed to another session — defeating the cross-log
+        // join the tag exists for.
+        let forged = "a@b.com\n[victim@icloud.com] [sess=3f2a1b8c]   Joined trust circle!";
+        let clean = sanitize(forged);
+        assert!(!clean.contains('\n'), "{clean}");
+        assert!(!clean.contains('\r'));
+        assert!(clean.starts_with("a@b.com"));
+        // Ordinary text, including non-ASCII, is untouched.
+        assert_eq!(sanitize("Grega's MacBook Air"), "Grega's MacBook Air");
+        assert_eq!(sanitize("iPhone de José"), "iPhone de José");
+    }
+
+    #[test]
+    fn passcode_length_counts_characters_not_bytes() {
+        // The log reports a passcode's length to tell a Mac login password from
+        // a 4/6-digit phone passcode. Counting UTF-8 bytes would report 10 for
+        // an 8-character accented password and send support down the wrong path.
+        assert_eq!("pässwörd".chars().count(), 8);
+        assert_eq!("pässwörd".len(), 10);
     }
 
     #[test]
