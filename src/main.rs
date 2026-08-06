@@ -171,6 +171,14 @@ impl Interact for CliInteract {
         eprint!("  Enter the passcode of that device: ");
         Ok(read_password())
     }
+
+    fn join_retryable(&self, _error: &'static str, detail: &str) {
+        // Without this the next prompt would appear with no explanation, and
+        // the user would assume they had mistyped the passcode — the one thing
+        // this error means they did not do.
+        eprintln!("  {detail}");
+        eprintln!("  Pick a different device and try again.");
+    }
 }
 
 // ── Password reading ────────────────────────────────────────────────────
@@ -328,15 +336,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Scoped so rustpush's own records carry `[sess=cli]` too, matching the
     // prefix on the pipeline's lines.
-    let beacons = logging::SESSION
-        .scope(
-            "cli".to_string(),
-            run_export(
-                ExportOpts { apple_id, password, anisette_url, debug, session_id: "cli".to_string() },
-                &CliInteract,
-            ),
-        )
-        .await?;
+    let beacons = logging::scope(
+        "cli".to_string(),
+        run_export(
+            ExportOpts { apple_id, password, anisette_url, debug, session_id: "cli".to_string() },
+            &CliInteract,
+        ),
+    )
+    .await?;
 
     // ── Write plist files ───────────────────────────────────────────
     if beacons.is_empty() {

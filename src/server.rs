@@ -98,10 +98,29 @@ pub enum Step {
     /// Initial state, before login has determined whether 2FA is required.
     Starting,
     AwaitingTfa,
-    AwaitingEscrow { devices: Vec<DeviceInfo> },
+    AwaitingEscrow {
+        devices: Vec<DeviceInfo>,
+        /// Which ask this is, counting from 1. A retry returns to this same
+        /// state, so a handler cannot tell "the pipeline is asking again" from
+        /// "the state I was posted against" by shape alone — and `wait_for`
+        /// reads the *current* value first, so it would answer a fresh post
+        /// with the stale retry it was made against and 409 forever while the
+        /// export ran on and its beacons were discarded. The count is the
+        /// ordering that makes the two distinguishable.
+        ask: u32,
+        /// Why the previous ask failed, when this one is a retry.
+        retry: Option<RetryNotice>,
+    },
     Running,
     Done { beacons: Vec<BeaconExport> },
     Failed { error: &'static str, detail: String },
+}
+
+/// Why the pipeline came back to ask for another device.
+#[derive(Clone, Debug)]
+pub struct RetryNotice {
+    pub error: &'static str,
+    pub detail: String,
 }
 
 pub struct Session {
@@ -125,6 +144,12 @@ pub struct ServerInteract {
     tfa_rx: StdMutex<Receiver<String>>,
     escrow_rx: StdMutex<Receiver<(usize, String)>>,
     passcode: StdMutex<Option<String>>,
+    /// Carries the last retryable join failure from `join_retryable` to the
+    /// `choose_bottle` that publishes it. Taken, not cloned: a notice must
+    /// surface once, on the ask it belongs to.
+    retry: StdMutex<Option<RetryNotice>>,
+    /// How many times we have asked for a device. See `Step::AwaitingEscrow`.
+    asks: StdMutex<u32>,
 }
 
 impl Interact for ServerInteract {
@@ -146,7 +171,14 @@ impl Interact for ServerInteract {
     }
 
     fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError> {
-        let _ = self.step_tx.send(Step::AwaitingEscrow { devices: devices.to_vec() });
+        let retry = self.retry.lock().unwrap().take();
+        let ask = {
+            let mut asks = self.asks.lock().unwrap();
+            *asks += 1;
+            *asks
+        };
+        let _ =
+            self.step_tx.send(Step::AwaitingEscrow { devices: devices.to_vec(), ask, retry });
         let (idx, passcode) = tokio::task::block_in_place(|| {
             self.escrow_rx.lock().unwrap().recv_timeout(INPUT_TIMEOUT)
         })
@@ -172,6 +204,12 @@ impl Interact for ServerInteract {
 
     fn get_passcode(&self) -> Result<String, PipelineError> {
         self.passcode.lock().unwrap().take().ok_or(PipelineError::Aborted)
+    }
+
+    fn join_retryable(&self, error: &'static str, detail: &str) {
+        slog!(self.id, "join failed retryably (code={error}) — asking for another device");
+        *self.retry.lock().unwrap() =
+            Some(RetryNotice { error, detail: detail.to_string() });
     }
 }
 
@@ -207,6 +245,8 @@ where
         tfa_rx: StdMutex::new(tfa_rx),
         escrow_rx: StdMutex::new(escrow_rx),
         passcode: StdMutex::new(None),
+        retry: StdMutex::new(None),
+        asks: StdMutex::new(0),
     });
     let started = Instant::now();
     // Run the pipeline on its own task so a panic (e.g. an unwrap on unexpected
@@ -216,7 +256,7 @@ where
     // tag, so rustpush's own log records are attributable to this attempt.
     let inner = tokio::spawn({
         let interact = interact.clone();
-        crate::logging::SESSION.scope(tag(id), async move { runner(interact).await })
+        crate::logging::scope(tag(id), async move { runner(interact).await })
     });
     // Held by the Session: this, not the wrapper's handle, is what actually
     // stops the export.
@@ -341,7 +381,7 @@ fn start_outcome(id: Uuid, outcome: Option<Step>) -> (bool, StatusCode, serde_js
             StatusCode::CREATED,
             json!({"session_id": id, "state": "awaiting_2fa"}),
         ),
-        Some(Step::AwaitingEscrow { devices }) => (
+        Some(Step::AwaitingEscrow { devices, .. }) => (
             true,
             StatusCode::CREATED,
             json!({"session_id": id, "state": "awaiting_passcode", "devices": devices}),
@@ -387,7 +427,7 @@ async fn submit_2fa(
     let _ = session.tfa_tx.send(body.code);
     let mut rx = session.step_rx.clone();
     match wait_for(&mut rx, START_TIMEOUT, |s| !matches!(s, Step::AwaitingTfa)).await {
-        Some(Step::AwaitingEscrow { devices }) => {
+        Some(Step::AwaitingEscrow { devices, .. }) => {
             slog!(id, "POST /2fa -> awaiting_passcode with {} device(s)", devices.len());
             (StatusCode::OK, Json(json!({"state": "awaiting_passcode", "devices": devices})))
                 .into_response()
@@ -430,24 +470,58 @@ async fn submit_escrow(
     // buffer a (device_index, passcode) tuple that choose_bottle later consumes
     // against a device the user never saw — burning an Apple escrow attempt.
     // One borrow for both the log and the guard — see the note in `submit_2fa`.
-    let (current, ready) = {
+    // `posted_against` is the ask this request answers; anything the pipeline
+    // publishes later carries a higher count. See `Step::AwaitingEscrow::ask`.
+    let (current, posted_against) = {
         let step = session.step_rx.borrow();
-        (step_name(&step), matches!(&*step, Step::AwaitingEscrow { .. }))
+        let ask = match &*step {
+            Step::AwaitingEscrow { ask, .. } => Some(*ask),
+            _ => None,
+        };
+        (step_name(&step), ask)
     };
     slog!(id, "POST /escrow: device_index={} passcode {} chars, session at {}",
           body.device_index, body.passcode.chars().count(), current);
-    if !ready {
+    let Some(posted_against) = posted_against else {
         slog!(id, "POST /escrow rejected: session is at {}, not awaiting_passcode", current);
         return wrong_step();
-    }
+    };
     let escrow_started = Instant::now();
     let _ = session.escrow_tx.send((body.device_index, body.passcode));
     let mut rx = session.step_rx.clone();
     let done = wait_for(&mut rx, EXPORT_TIMEOUT, |s| {
-        matches!(s, Step::Done { .. } | Step::Failed { .. })
+        // A retry lands back on AwaitingEscrow, which is also where we started.
+        // The ask count, not the shape, is what says the pipeline has moved on:
+        // `wait_for` reads the current value first, so matching on shape alone
+        // would answer this post with the state it was made against.
+        match s {
+            Step::Done { .. } | Step::Failed { .. } => true,
+            Step::AwaitingEscrow { ask, .. } => *ask > posted_against,
+            _ => false,
+        }
     })
     .await;
     match done {
+        // The device didn't work but the attempt is still good: the pipeline is
+        // parked on `choose_bottle` again, holding the login and the 2FA. The
+        // session stays alive so the next post picks another device, and the
+        // devices ride along so the client needn't have kept them.
+        Some(Step::AwaitingEscrow { devices, retry: Some(RetryNotice { error, detail }), .. }) => {
+            slog!(id, "POST /escrow -> {error} after {:.1}s, retryable: session stays at \
+                   awaiting_passcode with {} device(s)",
+                  escrow_started.elapsed().as_secs_f32(), devices.len());
+            (
+                status_for(error),
+                Json(json!({
+                    "error": error,
+                    "detail": detail,
+                    "state": "awaiting_passcode",
+                    "retryable": true,
+                    "devices": devices,
+                })),
+            )
+                .into_response()
+        }
         Some(Step::Done { beacons }) => {
             slog!(id, "POST /escrow -> done: {} beacon(s) in {:.1}s",
                   beacons.len(), escrow_started.elapsed().as_secs_f32());
@@ -561,6 +635,10 @@ fn status_for(code: &str) -> StatusCode {
     match code {
         "bad_credentials" => StatusCode::UNAUTHORIZED,
         "bad_passcode" | "bad_device_index" | "no_bottles" => StatusCode::BAD_REQUEST,
+        // Not a malformed request: the passcode was right and the input was
+        // valid. What conflicts is the state of the account's keychain trust
+        // circle, which no correction to this request can fix.
+        "trust_circle_signature" => StatusCode::CONFLICT,
         "session_not_found" => StatusCode::NOT_FOUND,
         "session_expired" => StatusCode::GONE,
         _ => StatusCode::BAD_GATEWAY,
@@ -650,6 +728,22 @@ pub async fn serve(port: u16, anisette_url: String) -> Result<(), Box<dyn std::e
 mod tests {
     use super::*;
     use tower::ServiceExt; // oneshot
+
+    #[test]
+    fn every_pipeline_code_maps_to_its_own_status() {
+        // The codes a client switches on, and the statuses that must not drift
+        // into each other — a 4xx that reads as "fix your input" is wrong for a
+        // failure the user's input cannot fix.
+        assert_eq!(status_for("bad_credentials"), StatusCode::UNAUTHORIZED);
+        assert_eq!(status_for("bad_passcode"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_for("trust_circle_signature"), StatusCode::CONFLICT);
+        assert_eq!(status_for("bad_device_index"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_for("no_bottles"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_for("session_not_found"), StatusCode::NOT_FOUND);
+        assert_eq!(status_for("session_expired"), StatusCode::GONE);
+        // Anything unrecognised is upstream's fault, not the caller's.
+        assert_eq!(status_for("apple_error"), StatusCode::BAD_GATEWAY);
+    }
 
     fn state_with(spawn: Spawner) -> AppState {
         AppState {
@@ -775,7 +869,8 @@ mod tests {
         // "awaiting_passcode", so the log must too.
         assert_eq!(step_name(&Step::Starting), "starting");
         assert_eq!(step_name(&Step::AwaitingTfa), "awaiting_2fa");
-        assert_eq!(step_name(&Step::AwaitingEscrow { devices: vec![] }), "awaiting_passcode");
+        assert_eq!(step_name(&Step::AwaitingEscrow { devices: vec![], ask: 1, retry: None }),
+                   "awaiting_passcode");
         assert_eq!(step_name(&Step::Running), "running");
         assert_eq!(step_name(&Step::Done { beacons: vec![] }), "done");
         assert_eq!(
@@ -856,7 +951,7 @@ mod tests {
         .await
         .expect("reached escrow");
         match step {
-            Step::AwaitingEscrow { devices } => assert_eq!(devices.len(), 2),
+            Step::AwaitingEscrow { devices, .. } => assert_eq!(devices.len(), 2),
             _ => panic!(),
         }
 
@@ -922,7 +1017,7 @@ mod tests {
 
         // 2FA skipped: device list returned directly so the client skips /2fa.
         let devices = vec![test_device("GYK3003QMY")];
-        let (keep, status, body) = start_outcome(id, Some(Step::AwaitingEscrow { devices }));
+        let (keep, status, body) = start_outcome(id, Some(Step::AwaitingEscrow { devices, ask: 1, retry: None }));
         assert!(keep && status == StatusCode::CREATED);
         assert_eq!(body["state"], "awaiting_passcode");
         assert_eq!(body["devices"][0]["serial"], "GYK3003QMY");
@@ -1050,6 +1145,54 @@ mod tests {
             r#"{"device_index":0,"passcode":"0000"}"#,
         ).await;
         assert_eq!(s2, StatusCode::OK);
+        assert_eq!(b2["state"], "done");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retryable_join_keeps_the_session_and_takes_another_device() {
+        // A signature failure is the chosen device's fault, not the login's. If
+        // it retired the session the user would have to re-enter their password
+        // and redo 2FA just to try the other device the error tells them to try.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let devices = [test_device("GYK3003QMY"), test_device("J9NQHW229W")];
+                assert_eq!(io.choose_bottle(&devices)?, 0);
+                let _ = io.get_passcode()?;
+                io.join_retryable(
+                    crate::pipeline::TRUST_CIRCLE_SIGNATURE,
+                    "signature check failed on a TLK share's signature",
+                );
+                // The retry: same login, same 2FA, different device.
+                assert_eq!(io.choose_bottle(&devices)?, 1);
+                let _ = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+
+        let (s1, b1) = req(
+            &st, "POST", &format!("/sessions/{id}/escrow"),
+            r#"{"device_index":0,"passcode":"0000"}"#,
+        ).await;
+        assert_eq!(s1, StatusCode::CONFLICT);
+        assert_eq!(b1["error"], "trust_circle_signature");
+        assert_eq!(b1["retryable"], true);
+        assert_eq!(b1["state"], "awaiting_passcode");
+        // The devices ride along so the client needn't have kept them.
+        assert_eq!(b1["devices"][1]["serial"], "J9NQHW229W");
+        // The session is the whole point: it must still be there.
+        assert!(!st.sessions.lock().await.is_empty(), "retryable failure retired the session");
+
+        // And the second device actually gets to run. Without an ordering
+        // guarantee this post would re-match the retry state it was made
+        // against and 409 again, forever.
+        let (s2, b2) = req(
+            &st, "POST", &format!("/sessions/{id}/escrow"),
+            r#"{"device_index":1,"passcode":"1111"}"#,
+        ).await;
+        assert_eq!(s2, StatusCode::OK, "second device never ran: {b2}");
         assert_eq!(b2["state"], "done");
     }
 

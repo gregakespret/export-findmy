@@ -152,8 +152,25 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (covers a wrong password *or* a wrong 2FA code — rustpush's login doesn't
-distinguish them), `bad_passcode`, `bad_device_index`, `no_bottles`,
-`wrong_step`, `session_not_found`, `session_expired`, `apple_error`.
+distinguish them), `bad_passcode`, `trust_circle_signature`, `bad_device_index`,
+`no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
+`apple_error`.
+
+`trust_circle_signature` (HTTP 409) is deliberately separate from
+`bad_passcode`: it means the escrow bottle decrypted — so the device passcode
+was correct — and the join then failed verifying one of the trust circle's
+signatures. Prompting for the passcode again cannot resolve it; the user should
+try a different trusted device. The server log names which signature failed.
+
+**It is also the one error that does not end the attempt.** When another device
+is available, `POST /escrow` answers with the session still live and the body
+carries `"retryable": true`, `"state": "awaiting_passcode"` and the `devices`
+list again — the login and 2FA are still held, so the client should re-render
+device selection and post to the same session rather than starting over. Up to
+three devices may be tried per attempt; the last failure comes back without
+`retryable` and retires the session as any other failure does. A client that
+ignores `retryable` and treats the 409 as fatal still behaves correctly, just
+less kindly.
 
 ## Output format
 
