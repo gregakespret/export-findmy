@@ -126,17 +126,18 @@ two exports in flight:
 [sess=3f2a1b8c] WARN  rustpush::icloud::keychain > Signature verification failed
 ```
 
-It defaults to `warn,export_findmy=info,rustpush::icloud::keychain=debug`; an
+It defaults to `warn,export_findmy=info,rustpush::icloud::keychain=info`; an
 empty `RUST_LOG` counts as unset (a cleared-but-present env var would otherwise
 silence everything). The filter in force is logged at startup.
 
 The keychain module is turned up because it is the only place that says *why* a
 trust-circle join stopped where it did, and the only place that reports what
 became of the escrow bottles. Everything it logs below `warn` is dropped unless
-it is on the allowlist in `src/logging.rs` — the join checkpoints, and the two
-escrow-lookup diagnostics. That allowlist is a redaction guard, not a verbosity
+it is on the allowlist in `src/logging.rs` — the join checkpoints, and the
+escrow-lookup counts. That allowlist is a redaction guard, not a verbosity
 setting: it outranks `RUST_LOG`, because the same module `info!`s decrypted
-keychain contents as hex.
+keychain contents as hex. The other half of the escrow diagnosis, the metadata
+schema mismatch, is a `warn!` and prints without it.
 
 **Do not widen the filter to `rustpush=debug` on a deployed instance:** the
 allowlist covers only `rustpush::icloud::keychain`, and rustpush debug-logs the
