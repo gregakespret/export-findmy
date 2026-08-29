@@ -151,10 +151,18 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `secure_locations_shared_secret`, `public_key`) plus `identifier`, `name`,
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
-(covers a wrong password *or* a wrong 2FA code — rustpush's login doesn't
-distinguish them), `bad_passcode`, `trust_circle_signature`, `bad_device_index`,
+(a wrong password *or* a wrong 2FA code — Apple judged what was typed and
+rejected it), `bad_passcode`, `trust_circle_signature`, `bad_device_index`,
 `no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
 `apple_error`.
+
+A sign-in that fails *without* Apple ever judging the credentials — a non-2xx
+from a GSA endpoint, an anisette outage, an HTML error page where a plist was
+promised — is `apple_error` (HTTP 502), **not** `bad_credentials`. Clients
+must not treat every `POST /sessions` failure as a wrong password: the whole
+point of the split is that `detail` now tells the user whether retyping the
+password can possibly help, so surface `detail` rather than a message of your
+own.
 
 `trust_circle_signature` (HTTP 409) is deliberately separate from
 `bad_passcode`: it means the escrow bottle decrypted — so the device passcode

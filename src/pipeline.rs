@@ -92,8 +92,11 @@ pub const TRUST_CIRCLE_SIGNATURE: &str = "trust_circle_signature";
 /// Failure at a specific pipeline stage, mapped to the API's error codes.
 #[derive(Debug)]
 pub enum PipelineError {
-    /// SRP + 2FA both surface here — rustpush's login doesn't separate a bad
-    /// password from a bad 2FA code, so this covers both step-1/step-2 failures.
+    /// Reached only when Apple itself judged what the user typed and said no —
+    /// a wrong password or a wrong 2FA code. See `login_error`, which is what
+    /// keeps everything else (transport, anisette, an unparseable response) out
+    /// of here: this variant is a 401, and a 401 tells the user to go and
+    /// retype something, which is wrong advice for any of those.
     BadCredentials(String),
     BadPasscode(String),
     /// The trust-circle join failed a *signature* check, not the passcode. Kept
@@ -142,6 +145,96 @@ impl std::fmt::Display for PipelineError {
 }
 
 impl std::error::Error for PipelineError {}
+
+/// Shown when the sign-in failed *before* Apple ever judged the credentials —
+/// an HTTP error from a GSA endpoint, a response we could not parse.
+/// Deliberately says what it is not: the whole point of splitting these out is
+/// that the previous blanket `bad_credentials` told users with a correct
+/// password to go and retype it.
+const LOGIN_UPSTREAM: &str =
+    "Could not reach Apple's sign-in service. This is not a problem with your \
+     Apple ID or password — please wait a minute and try again.";
+
+/// The anisette provider is *ours* to fix, not Apple's and not the user's, so
+/// it does not get [`LOGIN_UPSTREAM`]'s wording. Step 1 logs which anisette
+/// host a run used precisely to keep "Apple rejected us" and "our provisioning
+/// host was down" apart; folding this into the Apple sentence would throw that
+/// distinction away at the one place the user actually reads it — and tell
+/// them to wait a minute for something that waiting cannot fix.
+const LOGIN_ANISETTE: &str =
+    "Could not prepare the sign-in: the provisioning service this tool depends \
+     on did not respond. This is not a problem with your Apple ID or password, \
+     and it is not Apple — it is on our side. Please try again later.";
+
+/// Which `PipelineError` a failed [`AppleAccount::login`] becomes.
+///
+/// `icloud_auth::Error` mixes four unrelated failures behind one type, and
+/// mapping the lot to `bad_credentials` is what produced our commonest support
+/// case: "it says my password is wrong, but it isn't".
+///
+/// The discriminator is the *raise site*, not the variant name. `AuthSrp` reads
+/// like a rejected password and is not one: all six of its sites are
+/// `if !res.status().is_success()` against a GSA endpoint (four on
+/// `gsa.apple.com`, two on `gsas.apple.com`), i.e. a non-2xx — and only the two
+/// in `send_2fa_to_devices` / `send_sms_2fa_to_devices` are even reachable from
+/// `login`. Apple rejects a password with a **200** carrying `ec != 0`, which
+/// arrives here as `AuthSrpWithMessage` — that is where -22406 "Enter the
+/// correct password for this Apple Account" comes from. `PlistError` is the
+/// same story one layer down: an HTML error page where a plist was promised.
+///
+/// Matched exhaustively on purpose. `icloud_auth::Error` is not
+/// `#[non_exhaustive]`, so a `_` arm would let the next dependency bump add a
+/// credential verdict that silently lands in [`LOGIN_UPSTREAM`] — the same bug
+/// this function exists to close, pointing the other way, with nothing to catch
+/// it. The exhaustive match makes that a build error instead.
+fn login_error(e: &icloud_auth::Error) -> PipelineError {
+    use icloud_auth::Error as E;
+    match e {
+        // Apple looked at the credentials and said no: `check_error` raises
+        // `AuthSrpWithMessage` on a 200 with `ec != 0`, carrying wording more
+        // specific than anything we would write (locked account, wrong
+        // password, expired code), so it is passed through.
+        //
+        // `Bad2faCode` is the known soft spot in that rule. Its one raise site
+        // is `if res.status() != 200` on `/auth/verify/phone/securitycode`, so
+        // a 5xx there still reports a correct SMS code as a wrong one. Kept
+        // here because that endpoint answers a wrong code far more often than
+        // it breaks, and the two are indistinguishable from this side; closing
+        // it properly means splitting the status check upstream in rustpush.
+        // The trusted-device path is unaffected — `verify_2fa` goes through
+        // `check_error`, so a wrong code there arrives as `AuthSrpWithMessage`.
+        E::AuthSrpWithMessage(..) | E::Bad2faCode => {
+            PipelineError::BadCredentials(format!("Apple sign-in failed: {e}"))
+        }
+        // The credentials are fine; the *account* is in a state that blocks
+        // this login. Not `bad_credentials`: re-typing the password cannot fix
+        // any of them. Each Display string is rustpush's own fixed text, not
+        // something Apple sent — `ExtraStep` in particular is the catch-all for
+        // any `au` value rustpush does not recognise and drops its payload, so
+        // "log in to appleid.apple.com" is a decent guess rather than Apple's
+        // instruction. The dropped payload is the reason the log keeps `{:?}`.
+        //
+        // Only `ExtraStep` is reachable today: the other two are raised solely
+        // inside `AppleAccount::get_auth_extras`, which nothing in rustpush
+        // calls. They are listed because the match is exhaustive and this is
+        // where they belong the day it acquires a caller.
+        E::ExtraStep(_) | E::FailedGetting2FAConfig | E::HardwareKeyError => {
+            PipelineError::Apple(format!("Apple sign-in failed: {e}"))
+        }
+        // Our own provisioning dependency, not Apple's service — see
+        // `LOGIN_ANISETTE`.
+        E::ErrorGettingAnisette(_) => PipelineError::Apple(LOGIN_ANISETTE.to_string()),
+        // Transport or a response we could not parse — nothing about the
+        // user's input. The variant and its payload are in the log line above;
+        // the user gets a sentence they can act on instead.
+        E::Parse
+        | E::AuthSrp
+        | E::HappyBirthdayError
+        | E::PlistError(_)
+        | E::ReqwestError(_)
+        | E::SerdeError(_) => PipelineError::Apple(LOGIN_UPSTREAM.to_string()),
+    }
+}
 
 /// Supplies the three inputs that arrive mid-login. Must be `Send + Sync` so the
 /// server can drive the pipeline from a spawned task (`&dyn Interact` is captured
@@ -254,7 +347,12 @@ pub async fn run_export(
         AppleAccount::login(appleid_closure, tfa_closure, login_info, anisette_client.clone())
             .await
             .map_err(|e| {
-                step_failed!("[2/7] login", PipelineError::BadCredentials, "Apple sign-in failed", e)
+                // Not `step_failed!`: the log keeps the full error (and its
+                // variant, via `{:?}`) while the user-facing message depends on
+                // which kind of failure it was — see `login_error`.
+                log!("!! FAILED at [2/7] login after {:.1}s: {} [{:?}]",
+                     started.elapsed().as_secs_f32(), e, e);
+                login_error(&e)
             })?;
 
     // These three were `expect`/`unwrap`: a panic unwinding out of the pipeline
@@ -737,6 +835,80 @@ mod tests {
         // an 8-character accented password and send support down the wrong path.
         assert_eq!("pässwörd".chars().count(), 8);
         assert_eq!("pässwörd".len(), 10);
+    }
+
+    /// The bug this file's `login_error` exists to stop: five sessions in one
+    /// eight-minute window were told "Apple sign-in failed: Failed to parse a
+    /// plist Serde(invalid type: string "<html>", expected a map)" under
+    /// `bad_credentials` — i.e. a user whose password was never even checked
+    /// was told to check their password. If any arm here starts returning
+    /// `bad_credentials` again, that support case is back.
+    #[test]
+    fn login_error_does_not_blame_the_password_for_an_upstream_failure() {
+        use icloud_auth::Error as E;
+
+        // Exactly what production hit: an HTML error page where a plist was
+        // promised, which `?` converts into `Error::PlistError`.
+        let html: E = plist::from_bytes::<plist::Dictionary>(b"<html>Bad Gateway</html>")
+            .unwrap_err()
+            .into();
+        // Reads like a rejected password; is not one. Every `AuthSrp` site in
+        // icloud_auth is `if !res.status().is_success()` against a GSA endpoint.
+        for e in [html, E::AuthSrp, E::Parse, E::HappyBirthdayError] {
+            let mapped = login_error(&e);
+            assert_ne!(mapped.code(), "bad_credentials", "{e:?} must not blame the password");
+            assert_eq!(mapped.code(), "apple_error");
+            assert_eq!(mapped.to_string(), LOGIN_UPSTREAM);
+        }
+
+        // Account state: the credentials are right, so re-typing them is not the
+        // way out, and the specific advice must survive. Asserting it is *not*
+        // `LOGIN_UPSTREAM` is the load-bearing half — `contains(e)` alone holds
+        // by construction of the arm and would still pass if the arm were
+        // deleted into the generic bucket, which is the regression to catch.
+        for e in [E::ExtraStep("repair".into()), E::FailedGetting2FAConfig, E::HardwareKeyError] {
+            let mapped = login_error(&e);
+            assert_ne!(mapped.code(), "bad_credentials", "{e:?} must not blame the password");
+            assert_eq!(mapped.code(), "apple_error");
+            assert_ne!(mapped.to_string(), LOGIN_UPSTREAM, "{e:?} lost its specific advice");
+            assert!(mapped.to_string().contains(&e.to_string()), "{mapped} drops the advice");
+        }
+    }
+
+    /// A dead anisette host is *ours*, not Apple's. Telling the user "could not
+    /// reach Apple's sign-in service, wait a minute" points support at Apple
+    /// for an outage only we can clear — and step 1 logs the anisette URL
+    /// specifically to keep those two apart.
+    #[test]
+    fn login_error_does_not_blame_apple_for_our_own_provisioning_outage() {
+        let e = icloud_auth::Error::ErrorGettingAnisette(
+            omnisette::AnisetteError::AnisetteNotProvisioned,
+        );
+        let mapped = login_error(&e);
+        assert_eq!(mapped.code(), "apple_error");
+        assert_ne!(mapped.code(), "bad_credentials");
+        assert_ne!(mapped.to_string(), LOGIN_UPSTREAM, "anisette is not Apple's service");
+        assert_eq!(mapped.to_string(), LOGIN_ANISETTE);
+    }
+
+    /// The other half: a genuinely wrong password must still say so, or the fix
+    /// above has simply moved the confusion to the users who *did* mistype.
+    #[test]
+    fn login_error_keeps_apples_own_verdict_on_the_credentials() {
+        use icloud_auth::Error as E;
+
+        // Apple rejects a password with HTTP 200 and `ec != 0` — this variant,
+        // not `AuthSrp`. -22406 is the code our reporters actually saw.
+        let rejected = E::AuthSrpWithMessage(
+            -22406,
+            "Enter the correct password for this Apple Account".into(),
+        );
+        let mapped = login_error(&rejected);
+        assert_eq!(mapped.code(), "bad_credentials");
+        assert!(mapped.to_string().contains("-22406"), "{mapped}");
+        assert!(mapped.to_string().contains("Enter the correct password"), "{mapped}");
+
+        assert_eq!(login_error(&E::Bad2faCode).code(), "bad_credentials");
     }
 
     #[test]
