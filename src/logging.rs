@@ -16,9 +16,10 @@
 //! — but that module also logs decrypted keychain material (`info!("data {hex}")`),
 //! so simply raising the level on it would spill secrets into a hosted log store.
 //! [`CHECKPOINTS`] is the way out: that one module is raised to `info`, an
-//! allowlist drops every record that isn't a known-safe checkpoint, and the last
-//! checkpoint reached is remembered per session so the pipeline can name the
-//! failing signature at the default `warn` level.
+//! allowlist drops every record that is neither a known-safe checkpoint nor one
+//! of the [`SAFE_PREFIXES`] diagnostics, and the last checkpoint reached is
+//! remembered per session so the pipeline can name the failing signature at the
+//! default `warn` level.
 
 use std::future::Future;
 use std::io::Write;
@@ -134,19 +135,72 @@ fn is_keychain_detail(target: &str, level: log::Level) -> bool {
     target.starts_with(KEYCHAIN_TARGET) && level > log::Level::Warn
 }
 
-/// The checkpoint this message is, or `None` if it isn't one — in which case it
-/// must not be printed. Deliberately an allowlist: a denylist would leak any
-/// sensitive line a future rustpush adds, and this module already has one
-/// (`info!("data {}", encode_hex(&data))` over decrypted keychain contents).
+/// The checkpoint this message is, or `None` if it isn't one. Deliberately an
+/// allowlist: a denylist would leak any sensitive line a future rustpush adds,
+/// and this module already has one (`info!("data {}", encode_hex(&data))` over
+/// decrypted keychain contents).
 fn classify(message: &str) -> Option<usize> {
     CHECKPOINTS.iter().position(|c| message.starts_with(c.prefix))
+}
+
+/// Lines from the keychain module that are safe to print but say nothing about
+/// *where* a join is. Kept apart from [`CHECKPOINTS`] on purpose: these are
+/// emitted by `get_viable_bottles`, which runs before the join starts, so
+/// filing them as checkpoints would leave a bogus position in the slot a join
+/// failure reads to name its failing signature.
+///
+/// They are the discriminator for a `no_bottles` failure, which is otherwise
+/// unanswerable. Our own count is taken *after* rustpush has already discarded
+/// every bottle whose metadata would not deserialize, so "0 returned" reads
+/// identically whether Apple sent nothing at all or we threw away everything it
+/// sent — the exact question a user with a trusted iPhone and iCloud Keychain
+/// on leaves us with. Together with the module's `warn!`s (which were never
+/// filtered) they separate the two:
+///
+/// | metadata records | viable bottles | what it means                        |
+/// |------------------|----------------|--------------------------------------|
+/// | 0                | 0              | the account really has no escrow      |
+/// | >0               | >0, discarded  | our deserialization, and our bug      |
+/// | 0                | >0             | escrow-proxy / shard mismatch         |
+/// | >0               | 0              | Cuttlefish rejected them, not us      |
+///
+/// Both carry counts, and the mismatch line adds plist key *names* with their
+/// value *types* — never key material. It also carries serde's error verbatim,
+/// and that one is *not* value-free: a type mismatch renders as `invalid type:
+/// string "7", expected u32`, quoting the offending value in full. The fields
+/// that can reach it are `serial`, `build`, `bottleID`, the timestamp and
+/// `escrowedSPKI` (a public key), so the worst case is a device serial in the
+/// log store rather than a secret — but it is a real value, and a prefix match
+/// cannot see the tail. Bounding it belongs upstream, where it is formatted.
+///
+/// Only the first of the two is actually filtered today: as of rustpush
+/// `317d605` the mismatch is a `warn!`, and warnings never reach the allowlist
+/// at all ([`is_keychain_detail`]). Its entry stays because that is upstream's
+/// call to change, and the line has to survive it either way — the allowlist is
+/// what keeps it printable if the level ever drops back below `warn`.
+const SAFE_PREFIXES: &[&str] = &[
+    // `info!`, filtered.
+    "Escrow lookup returned ",
+    // `warn!` as of 317d605, so currently printed without consulting this list.
+    "Escrow metadata schema mismatch: ",
+];
+/// Whether a non-checkpoint keychain line is nonetheless safe to print.
+fn is_safe_diagnostic(message: &str) -> bool {
+    SAFE_PREFIXES.iter().any(|p| message.starts_with(p))
 }
 
 /// Dependencies stay at `warn` — that is the level rustpush reports its reasons
 /// at, and anything lower is noise. Our own crate's `log` records are `info`, so
 /// a bare `warn` would silence them. The keychain module is the one exception,
-/// raised to `info` for [`CHECKPOINTS`]; everything it logs at that level that
-/// isn't a checkpoint is dropped before it reaches the output.
+/// raised to `info` for [`CHECKPOINTS`] and [`SAFE_PREFIXES`]; everything it
+/// logs at that level that is on neither allowlist is dropped before it reaches
+/// the output.
+///
+/// `info` and no further. `debug` would buy exactly one more record in this
+/// module — `debug!("Insert key uuid {uuid}")` — which both allowlists reject
+/// anyway, so raising it costs a formatted string per key insert and admits
+/// nothing. The escrow diagnostics do not need it: the lookup counts are an
+/// `info!` and the schema mismatch a `warn!` (rustpush `317d605`).
 const DEFAULT_FILTER: &str = "warn,export_findmy=info,rustpush::icloud::keychain=info";
 
 /// The filter to run with. `RUST_LOG` overrides the default, but a variable that
@@ -175,10 +229,14 @@ fn format_record(
         // not a verbosity setting, and an operator raising the level to debug a
         // join must not thereby dump keychain contents into a hosted log store.
         // Writing nothing emits nothing.
-        let Some(idx) = classify(&record.args().to_string()) else {
-            return Ok(());
-        };
-        note_checkpoint(idx);
+        let message = record.args().to_string();
+        match classify(&message) {
+            Some(idx) => note_checkpoint(idx),
+            // Printed, but deliberately not recorded as a position — see
+            // [`SAFE_PREFIXES`].
+            None if is_safe_diagnostic(&message) => {}
+            None => return Ok(()),
+        }
     }
     writeln!(
         buf,
@@ -227,9 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn default_filter_admits_the_keychain_checkpoints() {
+    fn default_filter_admits_the_keychain_checkpoints_and_diagnostics() {
         // Without this directive the checkpoints never reach the format
-        // closure and every join failure reports as unexplained.
+        // closure and every join failure reports as unexplained. `info` is
+        // enough for the escrow lookup counts too; the schema mismatch that
+        // completes the diagnosis arrives at `warn` and needs no directive at
+        // all. Nothing in this module wants `debug` — see [`DEFAULT_FILTER`].
         assert!(DEFAULT_FILTER.contains("rustpush::icloud::keychain=info"));
     }
 
@@ -397,6 +458,62 @@ mod tests {
         scope("t".to_string(), async {
             emit(&logger, KEYCHAIN_TARGET, log::Level::Trace, "data 62706c69737430");
             assert_eq!(written(&sink), "");
+        })
+        .await;
+    }
+
+    #[test]
+    fn the_escrow_diagnostics_are_matched_as_rustpush_formats_them() {
+        // Verbatim from rustpush 317d605 — an allowlist that matched a
+        // paraphrase would be config matching nothing, which reads as healthy.
+        assert!(is_safe_diagnostic(
+            "Escrow lookup returned 3 metadata record(s) and 0 viable Cuttlefish bottle(s)"
+        ));
+        // A *missing* `passcodeGeneration` is not the sample to pin: the same
+        // upstream change gives that field `#[serde(default)]`, so serde fills
+        // it rather than erroring. What actually reaches this line is a type
+        // mismatch — and serde quotes the offending value.
+        assert!(is_safe_diagnostic(
+            "Escrow metadata schema mismatch: invalid type: string \"7\", expected u32; \
+             top-level shape: [bottleId:string, escrowedSPKI:data]"
+        ));
+        // Prefix, not substring: a future line whose *contents* happen to
+        // mention escrow is not thereby cleared to print.
+        assert!(!is_safe_diagnostic("Insert key for Escrow lookup returned"));
+        assert!(!is_safe_diagnostic("data 62706c69737430"));
+    }
+
+    #[tokio::test]
+    async fn the_escrow_diagnostics_print_without_claiming_a_join_position() {
+        // Both lines are emitted by `get_viable_bottles`, before the join
+        // starts. Recording them as checkpoints would make a later failure
+        // name a signature it never got as far as verifying.
+        //
+        // At the levels rustpush 317d605 emits them: the counts as an `info!`,
+        // which the allowlist has to pass, and the mismatch as a `warn!`, which
+        // never reaches the allowlist. `is_safe_diagnostic` above is what keeps
+        // the second printable if upstream ever drops it below `warn` again.
+        let (logger, sink) = piped_logger(DEFAULT_FILTER);
+        scope("t".to_string(), async {
+            emit(
+                &logger,
+                KEYCHAIN_TARGET,
+                log::Level::Info,
+                "Escrow lookup returned 3 metadata record(s) and 0 viable Cuttlefish bottle(s)",
+            );
+            emit(
+                &logger,
+                KEYCHAIN_TARGET,
+                log::Level::Warn,
+                "Escrow metadata schema mismatch: invalid type: string \"7\", expected u32; \
+                 top-level shape: [bottleId:string, escrowedSPKI:data]",
+            );
+            let out = written(&sink);
+            // The counts are the discriminator for a `no_bottles` failure…
+            assert!(out.contains("3 metadata record(s) and 0 viable"), "{out}");
+            // …and the serde error is what turns it into a fix.
+            assert!(out.contains("invalid type: string \"7\", expected u32"), "{out}");
+            assert!(last_checkpoint().is_none(), "diagnostic recorded as a checkpoint");
         })
         .await;
     }
