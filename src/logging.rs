@@ -15,10 +15,11 @@
 //! The lines that would separate them are `info!`s in `rustpush::icloud::keychain`
 //! — but that module also logs decrypted keychain material (`info!("data {hex}")`),
 //! so simply raising the level on it would spill secrets into a hosted log store.
-//! [`CHECKPOINTS`] is the way out: that one module is raised to `info`, an
-//! allowlist drops every record that isn't a known-safe checkpoint, and the last
-//! checkpoint reached is remembered per session so the pipeline can name the
-//! failing signature at the default `warn` level.
+//! [`CHECKPOINTS`] is the way out: that one module is raised to `debug`, an
+//! allowlist drops every record that is neither a known-safe checkpoint nor one
+//! of the [`SAFE_PREFIXES`] diagnostics, and the last checkpoint reached is
+//! remembered per session so the pipeline can name the failing signature at the
+//! default `warn` level.
 
 use std::future::Future;
 use std::io::Write;
@@ -163,8 +164,15 @@ fn classify(message: &str) -> Option<usize> {
 /// | 0                | >0             | escrow-proxy / shard mismatch         |
 /// | >0               | 0              | Cuttlefish rejected them, not us      |
 ///
-/// Both carry counts, a serde error and plist key *names* with their value
-/// *types* — never a metadata value and never key material. (rustpush 96c1228.)
+/// Both carry counts, and the mismatch line adds plist key *names* with their
+/// value *types* — never key material. It also carries serde's error verbatim,
+/// and that one is *not* value-free: a type mismatch renders as `invalid type:
+/// string "7", expected u32`, quoting the offending value in full. The fields
+/// that can reach it are `serial`, `build`, `bottleID`, the timestamp and
+/// `escrowedSPKI` (a public key), so the worst case is a device serial in the
+/// log store rather than a secret — but it is a real value, and a prefix match
+/// here cannot see the tail. Bounding it belongs upstream, where the error is
+/// formatted. (rustpush 96c1228.)
 const SAFE_PREFIXES: &[&str] = &[
     "Escrow lookup returned ",
     "Escrow metadata schema mismatch: ",
@@ -456,8 +464,12 @@ mod tests {
         assert!(is_safe_diagnostic(
             "Escrow lookup returned 3 metadata record(s) and 0 viable Cuttlefish bottle(s)"
         ));
+        // A *missing* `passcodeGeneration` is not the sample to pin: 96c1228
+        // gives that field `#[serde(default)]` in the same commit, so serde
+        // fills it rather than erroring. What actually reaches this line is a
+        // type mismatch — and serde quotes the offending value.
         assert!(is_safe_diagnostic(
-            "Escrow metadata schema mismatch: missing field `passcodeGeneration`; \
+            "Escrow metadata schema mismatch: invalid type: string \"7\", expected u32; \
              top-level shape: [bottleId:string, escrowedSPKI:data]"
         ));
         // Prefix, not substring: a future line whose *contents* happen to
@@ -483,14 +495,14 @@ mod tests {
                 &logger,
                 KEYCHAIN_TARGET,
                 log::Level::Debug,
-                "Escrow metadata schema mismatch: missing field `passcodeGeneration`; \
+                "Escrow metadata schema mismatch: invalid type: string \"7\", expected u32; \
                  top-level shape: [bottleId:string, escrowedSPKI:data]",
             );
             let out = written(&sink);
             // The counts are the discriminator for a `no_bottles` failure…
             assert!(out.contains("3 metadata record(s) and 0 viable"), "{out}");
-            // …and the field name is what turns it into a fix.
-            assert!(out.contains("missing field `passcodeGeneration`"), "{out}");
+            // …and the serde error is what turns it into a fix.
+            assert!(out.contains("invalid type: string \"7\", expected u32"), "{out}");
             assert!(last_checkpoint().is_none(), "diagnostic recorded as a checkpoint");
         })
         .await;
