@@ -89,6 +89,109 @@ pub struct BeaconExport {
 /// hasn't failed the *attempt*, it has failed this device.
 pub const TRUST_CIRCLE_SIGNATURE: &str = "trust_circle_signature";
 
+/// The code for [`PipelineError::EscrowClub`], for the same reason as
+/// [`TRUST_CIRCLE_SIGNATURE`]: the retry path reports it before any error value
+/// exists.
+pub const ESCROW_CLUB: &str = "escrow_club";
+
+/// Apple's escrow proxy said no. Split out of the raw `PushError::EscrowError`
+/// because that variant covers every non-2xx from `/escrowproxy/api/*`, and
+/// those endpoints serve two stages that need opposite advice:
+///
+/// - `srp_init` / `recover`, which is where the device passcode is checked;
+/// - `get_club_cert` / `enroll`, which deposit *our own* new escrow record from
+///   `create_bottle`, and run only after `recover_bottle` has already accepted
+///   the passcode.
+///
+/// Apple labels the second group's failures `CLUBH ERROR`. Reading one of those
+/// as a wrong passcode is what put "wrong passcode?" in front of four users
+/// whose passcode Apple had already verified.
+#[derive(Debug, PartialEq)]
+pub struct EscrowFailure {
+    pub status: String,
+    pub message: String,
+    /// The two counters in `respBlob` — read as (spent, remaining) escrow
+    /// attempts. Provisional: the reading rests on one observed transition,
+    /// (0, 9) to (1, 8), so it is logged for the operator and deliberately not
+    /// shown to users or branched on. Every sample that lands here either
+    /// confirms it or kills it.
+    pub attempts: Option<(u32, u32)>,
+}
+
+impl EscrowFailure {
+    /// True when Apple attributed the failure to the escrow *club* stage, which
+    /// by construction is past the passcode check.
+    pub fn is_club(&self) -> bool {
+        self.message.contains("CLUBH")
+    }
+}
+
+/// Pull the escrow proxy's own words out of a rustpush error, if that is what
+/// this is. `None` for every other failure — including a genuine bad passcode
+/// reported some other way, which must keep falling through to `BadPasscode`.
+pub fn escrow_failure(e: &PushError) -> Option<EscrowFailure> {
+    let PushError::EscrowError(value) = e else {
+        return None;
+    };
+    let dict = value.as_dictionary()?;
+    let text = |k: &str| {
+        dict.get(k)
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(EscrowFailure {
+        status: text("status"),
+        message: text("message"),
+        attempts: escrow_attempts(&text("respBlob")),
+    })
+}
+
+/// Decode the attempt counters from the escrow response blob.
+///
+/// The blob is an undocumented big-endian u32 record; words 7 and 8 are the
+/// pair that moved together — (0, 9) on nine observed responses and (1, 8) on
+/// the one from an account that had genuinely mistyped a passcode earlier. The
+/// bounds check is the whole safety story: a shorter or re-shaped blob returns
+/// `None` rather than reporting two arbitrary words as a count.
+fn escrow_attempts(blob_b64: &str) -> Option<(u32, u32)> {
+    use base64::Engine;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(blob_b64)
+        .ok()?;
+    let word = |i: usize| -> Option<u32> {
+        let b = bytes.get(i * 4..i * 4 + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    Some((word(7)?, word(8)?))
+}
+
+/// What to tell a user whose trust-circle join failed a signature check.
+///
+/// The advice has to match what its reader can actually reach. "Try a different
+/// trusted device" is the way through only when there *is* another one; sent to
+/// an account with a single device it named the one action its reader could not
+/// take, and a real user spent fourteen minutes over six attempts on it before
+/// giving up. `failing` is `None` when the checkpoint trail cannot say which
+/// signature it was — a guess there is the thing that path exists to prevent.
+pub fn trust_circle_detail(failing: Option<&str>, device_count: usize) -> String {
+    let signature = failing.unwrap_or("an unidentified signature");
+    let preamble = format!(
+        "Joining the keychain trust circle failed a signature check on {signature}. \
+         This is not a wrong passcode — the device passcode already worked."
+    );
+    if device_count < 2 {
+        format!(
+            "{preamble} This Apple Account has only one trusted device, so there is no \
+             other one to try. Signing in to iCloud on a second Apple device with \
+             Keychain turned on, then connecting again, is what gets past this."
+        )
+    } else {
+        format!("{preamble} Try connecting with a different trusted device.")
+    }
+}
+
 /// Failure at a specific pipeline stage, mapped to the API's error codes.
 #[derive(Debug)]
 pub enum PipelineError {
@@ -105,6 +208,12 @@ pub enum PipelineError {
     /// bottle, so "check your passcode" sends the user round a loop that cannot
     /// terminate. Trying a different trusted device is the way out.
     TrustCircleSignature(String),
+    /// Apple's escrow club rejected the new escrow record we deposit while
+    /// joining. Kept apart from `BadPasscode` for the same reason as
+    /// `TrustCircleSignature` and with more certainty: this one is raised from
+    /// `create_bottle`, which `join_clique_from_escrow` reaches only after
+    /// `recover_bottle` has verified the passcode against Apple.
+    EscrowClub(String),
     BadDeviceIndex(String),
     NoBottles,
     Apple(String),
@@ -118,6 +227,7 @@ impl PipelineError {
             PipelineError::BadCredentials(_) => "bad_credentials",
             PipelineError::BadPasscode(_) => "bad_passcode",
             PipelineError::TrustCircleSignature(_) => TRUST_CIRCLE_SIGNATURE,
+            PipelineError::EscrowClub(_) => ESCROW_CLUB,
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
             PipelineError::NoBottles => "no_bottles",
             PipelineError::Apple(_) => "apple_error",
@@ -134,6 +244,7 @@ impl std::fmt::Display for PipelineError {
             PipelineError::BadCredentials(m) => write!(f, "{m}"),
             PipelineError::BadPasscode(m) => write!(f, "{m}"),
             PipelineError::TrustCircleSignature(m) => write!(f, "{m}"),
+            PipelineError::EscrowClub(m) => write!(f, "{m}"),
             PipelineError::BadDeviceIndex(m) => write!(f, "{m}"),
             PipelineError::NoBottles => {
                 write!(f, "No escrow bottles found. Make sure you have another trusted device.")
@@ -294,6 +405,17 @@ pub async fn run_export(
         };
     }
 
+    // Announce a step and record that we reached it, in one place so the two
+    // cannot drift. The recorded number is what lets a panicked run — which
+    // returns no error to classify — still be reported against the step it
+    // died in, instead of as "The export failed unexpectedly."
+    macro_rules! step {
+        ($n:literal, $($arg:tt)*) => {{
+            logging::note_step($n);
+            log!("[{}/7] {}", $n, format_args!($($arg)*));
+        }};
+    }
+
     // Until this existed, a failed export logged NOTHING: every `?` turned into
     // an HTTP error body for the caller and the log simply stopped at the last
     // step that had succeeded, so a user's screenshot could not be tied to the
@@ -323,7 +445,7 @@ pub async fn run_export(
     // The anisette server is third-party and has broken before; naming which
     // one this run used is the difference between "Apple rejected us" and "our
     // provisioning host was down".
-    log!("[1/7] Connecting to anisette server ({})...", opts.anisette_url);
+    step!(1, "Connecting to anisette server ({})...", opts.anisette_url);
     let anisette_config_path = PathBuf::from_str("anisette_state").unwrap();
     std::fs::create_dir_all(&anisette_config_path).ok();
 
@@ -337,7 +459,7 @@ pub async fn run_export(
         ))));
 
     // ── Step 2: Login to Apple ──────────────────────────────────────
-    log!("[2/7] Logging in to Apple ID...");
+    step!(2, "Logging in to Apple ID...");
     let apple_id_clone = opts.apple_id.clone();
     let password_hash: Vec<u8> = Sha256::digest(opts.password.as_bytes()).to_vec();
     let appleid_closure = move || (apple_id_clone.clone(), password_hash.clone());
@@ -383,7 +505,7 @@ pub async fn run_export(
     log!("  Logged in (dsid={}) after {:.1}s", dsid, started.elapsed().as_secs_f32());
 
     // ── Step 3: Get MobileMe delegate ───────────────────────────────
-    log!("[3/7] Fetching MobileMe delegate...");
+    step!(3, "Fetching MobileMe delegate...");
     let delegates =
         login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::MobileMe])
             .await
@@ -395,7 +517,7 @@ pub async fn run_export(
     })?;
 
     // ── Step 4: Create CloudKit + Keychain clients ──────────────────
-    log!("[4/7] Setting up CloudKit & Keychain...");
+    step!(4, "Setting up CloudKit & Keychain...");
     let keychain_state = KeychainClientState::new(dsid.clone(), adsid.clone(), &mobileme)
         .unwrap_or_else(|| {
             log!("  (escrowProxyUrl not in MobileMe config, using default)");
@@ -432,7 +554,7 @@ pub async fn run_export(
     });
 
     // ── Step 5: Join iCloud Keychain circle via escrow ────────────
-    log!("[5/7] Joining iCloud Keychain trust circle...");
+    step!(5, "Joining iCloud Keychain trust circle...");
     let all_bottles = keychain
         .get_viable_bottles()
         .await
@@ -525,6 +647,32 @@ pub async fn run_export(
         // four sites, so which one it was comes from `logging`'s checkpoint —
         // available here at the default log level, with no keychain contents
         // spilled to get it. See `logging::CHECKPOINTS`.
+        // An escrow-proxy rejection is checked first, because the club stage's
+        // failures used to land in the `BadPasscode` fallback below and tell the
+        // user their passcode was wrong minutes after Apple had accepted it.
+        if let Some(f) = escrow_failure(&e) {
+            log!("   escrow proxy said status={:?} message={:?}",
+                 sanitize(&f.status), sanitize(&f.message));
+            // Provisional reading (see `EscrowFailure::attempts`) — logged so
+            // the next occurrence either confirms or refutes it, and so a
+            // support case can say whether a passcode try was actually spent.
+            match f.attempts {
+                Some((spent, left)) => log!("   respBlob attempt counters: {spent} spent, \
+                                             {left} remaining (provisional reading)"),
+                None => log!("   respBlob absent or unrecognised; attempt counters unknown"),
+            }
+            if f.is_club() {
+                log!("   => escrow club rejection — NOT a rejected passcode \
+                      (`recover_bottle` had already verified it)");
+                return Err(PipelineError::EscrowClub(format!(
+                    "Apple's escrow service rejected the new recovery record ({}). \
+                     This is not a wrong passcode — Apple had already accepted the \
+                     one you entered. It is usually temporary: please start the \
+                     connection again in a few minutes.",
+                    f.status,
+                )));
+            }
+        }
         if !matches!(e, PushError::BadMsg) {
             return Err(PipelineError::BadPasscode(format!(
                 "Joining the keychain trust circle failed (wrong passcode?): {e}"
@@ -549,12 +697,7 @@ pub async fn run_export(
             None => log!("   => BadMsg at a point with no expected signature check; \
                           not one of the known join sites"),
         }
-        let detail = format!(
-            "Joining the keychain trust circle failed a signature check on {}. \
-             This is not a wrong passcode — the device passcode already worked. \
-             Try connecting with a different trusted device.",
-            failing.unwrap_or("an unidentified signature")
-        );
+        let detail = trust_circle_detail(failing, devices.len());
         // Retrying needs somewhere to go. With one device the user would just be
         // asked for the same one again — and the CLI, which auto-picks when
         // there is only one, would silently re-run it to the attempt limit.
@@ -570,7 +713,7 @@ pub async fn run_export(
     }
 
     // ── Step 6: Fetch BeaconStore records from CloudKit ─────────────
-    log!("[6/7] Fetching FindMy accessories from CloudKit...");
+    step!(6, "Fetching FindMy accessories from CloudKit...");
     let container = SEARCH_PARTY_CONTAINER
         .init(cloudkit.clone())
         .await
@@ -717,8 +860,8 @@ pub async fn run_export(
         );
     }
 
-    log!("[7/7] Assembling {} accessory export(s)... (total {:.1}s)",
-         accessories.len(), started.elapsed().as_secs_f32());
+    step!(7, "Assembling {} accessory export(s)... (total {:.1}s)",
+          accessories.len(), started.elapsed().as_secs_f32());
     if accessories.is_empty() {
         log!("!! WARNING: export succeeded with zero accessories — the caller will \
               report a connected account with no tags");
@@ -930,5 +1073,92 @@ mod tests {
         // Display is never empty — it becomes the JSON `detail`.
         assert!(!PipelineError::NoBottles.to_string().is_empty());
         assert!(!PipelineError::Aborted.to_string().is_empty());
+        // Same reasoning as trust_circle_signature, and the same regression to
+        // catch: folding this back into bad_passcode is what told four users
+        // their passcode was wrong after Apple had accepted it.
+        assert_eq!(PipelineError::EscrowClub("x".into()).code(), "escrow_club");
+        assert_ne!(PipelineError::EscrowClub("x".into()).code(), "bad_passcode");
+    }
+
+    /// One escrow response as production returned it, from the session that
+    /// prompted this: a `-6015` whose `message` names the CLUB handler. The
+    /// club endpoints (`get_club_cert`, `enroll`) are reached from
+    /// `create_bottle`, which `join_clique_from_escrow` runs only after
+    /// `recover_bottle` has verified the passcode against Apple — so this
+    /// response is proof the passcode was right, and the old code read it as
+    /// proof the passcode was wrong.
+    #[test]
+    fn a_club_rejection_is_not_a_rejected_passcode() {
+        let mut d = plist::Dictionary::new();
+        d.insert("version".into(), plist::Value::Integer(1.into()));
+        d.insert("status".into(), plist::Value::String("-6015".into()));
+        d.insert(
+            "message".into(),
+            plist::Value::String("CLUBH ERROR: Credential is not verified.".into()),
+        );
+        let f = escrow_failure(&PushError::EscrowError(plist::Value::Dictionary(d)))
+            .expect("an EscrowError must be recognised as one");
+        assert_eq!(f.status, "-6015");
+        assert!(f.is_club(), "{f:?} came from the club stage");
+
+        // The other side of the split: a failure from the SRP stage, where the
+        // passcode genuinely is checked, must NOT be claimed as a club error —
+        // otherwise the fix just moves the wrong message onto the users who
+        // did mistype.
+        let mut d = plist::Dictionary::new();
+        d.insert("status".into(), plist::Value::String("-8".into()));
+        d.insert(
+            "message".into(),
+            plist::Value::String("Wrong passcode entered.".into()),
+        );
+        let f = escrow_failure(&PushError::EscrowError(plist::Value::Dictionary(d))).unwrap();
+        assert!(!f.is_club(), "an SRP-stage rejection must stay a passcode error");
+
+        // And anything that is not an escrow rejection at all stays out.
+        assert_eq!(escrow_failure(&PushError::BadMsg), None);
+    }
+
+    /// The `respBlob` counters, decoded from two real production responses by
+    /// the same account minutes apart — the only observed transition, and the
+    /// whole basis for reading words 7 and 8 as (spent, remaining). Recorded as
+    /// a test so that a blob whose shape has moved fails here rather than
+    /// quietly reporting two arbitrary words as an attempt count.
+    #[test]
+    fn escrow_attempt_counters_decode_from_the_response_blob() {
+        let untouched = "AAAAYAAAAKYAAAACLFZ1OV4evksS6HrNXYwDwwAAAAAAAAAJAAAAogAAAAAAAAAA\
+                         AAAAJAAAACQAAAAkAAAAIL3fVo/7lGIRxKHiGEqH1S68wB+SZR1U55CnJ0DCfQsp";
+        assert_eq!(escrow_attempts(untouched), Some((0, 9)));
+        let one_spent = "AAAAYAAAAKYAAAACUdBYoaIFhIkR+dq7lwNNKwAAAAEAAAAIAAAAogAAAAAAAAAA\
+                         AAAAJAAAACQAAAAkAAAAIFUL7NM8ygIshY061nUFS0U+DCyeUTImTKwTHpLUeVa2";
+        assert_eq!(escrow_attempts(one_spent), Some((1, 8)));
+
+        // Absent, truncated or unparseable: no count, rather than a made-up one.
+        assert_eq!(escrow_attempts(""), None);
+        assert_eq!(escrow_attempts("AAAAYAAAAKYAAAAC"), None);
+        assert_eq!(escrow_attempts("not base64 at all"), None);
+    }
+
+    /// Advice a reader cannot act on is worse than no advice: with one trusted
+    /// device on the account, "try a different trusted device" names the one
+    /// move its reader does not have. A real user burned six attempts over
+    /// fourteen minutes against exactly this message.
+    #[test]
+    fn single_device_advice_does_not_ask_for_a_device_that_does_not_exist() {
+        let one = trust_circle_detail(Some("the escrow bottle's own escrowed-key signature"), 1);
+        assert!(!one.contains("different trusted device"), "{one}");
+        assert!(one.contains("only one trusted device"), "{one}");
+        // The passcode reassurance is the point of the whole variant and must
+        // survive in both branches.
+        assert!(one.contains("not a wrong passcode"), "{one}");
+
+        // With somewhere to go, the advice stands — this is the path that
+        // actually got three users connected.
+        let many = trust_circle_detail(Some("a peer signature"), 3);
+        assert!(many.contains("different trusted device"), "{many}");
+        assert!(many.contains("not a wrong passcode"), "{many}");
+
+        // No checkpoint reached: still a usable sentence, no invented cause.
+        let unknown = trust_circle_detail(None, 1);
+        assert!(unknown.contains("an unidentified signature"), "{unknown}");
     }
 }

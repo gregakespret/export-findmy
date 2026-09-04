@@ -36,6 +36,11 @@ tokio::task_local! {
     /// zero means "none yet". Shared rather than plain because the logger
     /// writes it and the pipeline reads it.
     static CHECKPOINT: Arc<AtomicUsize>;
+    /// Which of the pipeline's seven steps is in flight, or zero before the
+    /// first. Unlike [`CHECKPOINT`] this is read from *outside* the task, by
+    /// the caller handling its `JoinError` — a panic unwinds the task, so a
+    /// slot that lived only inside it would be gone exactly when it is needed.
+    static STEP: Arc<AtomicUsize>;
 }
 
 /// The rustpush module whose records get the allowlist treatment below.
@@ -108,7 +113,48 @@ fn current_session() -> String {
 /// Both must be scoped together — a tagged run with no slot would silently
 /// discard every checkpoint and report a join failure as unexplained.
 pub fn scope<F: Future>(tag: String, fut: F) -> impl Future<Output = F::Output> {
-    CHECKPOINT.scope(Arc::new(AtomicUsize::new(0)), SESSION.scope(tag, fut))
+    scope_tracked(tag, Arc::new(AtomicUsize::new(0)), fut)
+}
+
+/// [`scope`], but with the step slot supplied by the caller so it outlives the
+/// task. Only a caller that has to describe a *panicked* run needs this; a
+/// caller that gets its errors back as values can use [`scope`] and read
+/// [`STEP_NAMES`] from the error itself.
+pub fn scope_tracked<F: Future>(
+    tag: String,
+    step: Arc<AtomicUsize>,
+    fut: F,
+) -> impl Future<Output = F::Output> {
+    STEP.scope(
+        step,
+        CHECKPOINT.scope(Arc::new(AtomicUsize::new(0)), SESSION.scope(tag, fut)),
+    )
+}
+
+/// What each of the pipeline's steps is doing, indexed from step 1. Written for
+/// someone reading a failure, not for the log: "signing in to Apple" is what a
+/// support reply can repeat back, where "[2/7]" is not.
+pub const STEP_NAMES: &[&str] = &[
+    "contacting the anisette provisioning server",
+    "signing in to Apple",
+    "fetching the MobileMe delegate",
+    "setting up CloudKit and Keychain",
+    "joining the iCloud Keychain trust circle",
+    "fetching accessories from CloudKit",
+    "assembling the export",
+];
+
+/// Record that the pipeline has reached step `n` (1-based). No-op outside an
+/// export, where there is no slot and nothing that would read it.
+pub fn note_step(n: usize) {
+    let _ = STEP.try_with(|s| s.store(n, Ordering::Relaxed));
+}
+
+/// Name the step `slot` was on, for a run that ended without returning an error
+/// — i.e. one that panicked or was cancelled. `None` before the first step.
+pub fn step_name(slot: &AtomicUsize) -> Option<&'static str> {
+    let n = slot.load(Ordering::Relaxed);
+    n.checked_sub(1).and_then(|i| STEP_NAMES.get(i)).copied()
 }
 
 /// The last checkpoint this export reached, or `None` if it reached none.
@@ -524,5 +570,38 @@ mod tests {
         // own records); recording must not panic there.
         note_checkpoint(0);
         assert!(last_checkpoint().is_none());
+    }
+
+    /// The step slot exists for exactly one caller: the one describing a run
+    /// that *panicked*, which has no error value to classify. Naming a step is
+    /// its whole job, so an off-by-one in the table would blame another one.
+    #[tokio::test]
+    async fn a_panicked_run_can_still_be_named_by_its_step() {
+        let slot = Arc::new(AtomicUsize::new(0));
+        // Nothing reached yet: no step named, and no guess offered.
+        assert_eq!(step_name(&slot), None);
+
+        scope_tracked("test".to_string(), slot.clone(), async {
+            note_step(2);
+        })
+        .await;
+        // Read from *outside* the scope — the only place the caller handling a
+        // `JoinError` can read it from, because the task's own state is gone.
+        assert_eq!(step_name(&slot), Some("signing in to Apple"));
+
+        // 1-based at both ends, against the real table.
+        slot.store(1, Ordering::Relaxed);
+        assert_eq!(step_name(&slot), STEP_NAMES.first().copied());
+        slot.store(STEP_NAMES.len(), Ordering::Relaxed);
+        assert_eq!(step_name(&slot), STEP_NAMES.last().copied());
+        // The pipeline announces its steps as "[n/7]"; a table that drifts from
+        // that leaves the last step unnamed or names the wrong one.
+        assert_eq!(STEP_NAMES.len(), 7);
+    }
+
+    #[test]
+    fn a_step_outside_an_export_is_harmless() {
+        // Same reason as the checkpoint case above: the CLI path scopes no slot.
+        note_step(3);
     }
 }
