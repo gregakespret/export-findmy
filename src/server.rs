@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -254,9 +255,15 @@ where
     // Failed — otherwise the panic unwinds past the step publish and every
     // waiting handler hangs to its timeout. The task also carries the session
     // tag, so rustpush's own log records are attributable to this attempt.
+    // Shared with the wrapper below, because a panic unwinds the pipeline task
+    // and takes any state living inside it: this is the only thing that still
+    // knows where the run was when it died.
+    let step_slot = Arc::new(AtomicUsize::new(0));
     let inner = tokio::spawn({
         let interact = interact.clone();
-        crate::logging::scope(tag(id), async move { runner(interact).await })
+        crate::logging::scope_tracked(tag(id), step_slot.clone(), async move {
+            runner(interact).await
+        })
     });
     // Held by the Session: this, not the wrapper's handle, is what actually
     // stops the export.
@@ -276,14 +283,27 @@ where
                     Step::Failed { error: e.code(), detail: e.to_string() }
                 }
                 Err(e) => {
-                    // The user gets a deliberately vague message here; the log
-                    // is the only place the actual panic is recorded against
-                    // the session it killed.
-                    slog!(id, "export task {} after {:.1}s",
-                          join_failure(&e), started.elapsed().as_secs_f32());
+                    // The panic's own message stays in the log and out of the
+                    // response; the *step* is safe to hand over and is the part
+                    // a user can act on. Eight of these landed on real users in
+                    // four days, all of them at "signing in to Apple" (a bare
+                    // `panic!()` in omnisette's anisette header path) — and the
+                    // old wording, "The export failed unexpectedly.", named
+                    // neither the step nor a next move.
+                    let step = crate::logging::step_name(&step_slot);
+                    slog!(id, "export task {} after {:.1}s (step: {})",
+                          join_failure(&e), started.elapsed().as_secs_f32(),
+                          step.unwrap_or("not started"));
                     Step::Failed {
                         error: "apple_error",
-                        detail: "The export failed unexpectedly.".into(),
+                        detail: match step {
+                            Some(what) => format!(
+                                "The connection failed unexpectedly while {what}. \
+                                 This is a fault on our side, not a problem with \
+                                 your Apple Account — please try again."
+                            ),
+                            None => "The export failed unexpectedly.".into(),
+                        },
                     }
                 }
             };
@@ -639,6 +659,11 @@ fn status_for(code: &str) -> StatusCode {
         // valid. What conflicts is the state of the account's keychain trust
         // circle, which no correction to this request can fix.
         "trust_circle_signature" => StatusCode::CONFLICT,
+        // Apple's escrow proxy refused a record it had every reason to accept,
+        // two stages after it verified the passcode. Nothing about the request
+        // was wrong, so it is an upstream failure — and 4xx here is what would
+        // send the caller back to blaming the user's input.
+        "escrow_club" => StatusCode::BAD_GATEWAY,
         "session_not_found" => StatusCode::NOT_FOUND,
         "session_expired" => StatusCode::GONE,
         _ => StatusCode::BAD_GATEWAY,
@@ -741,6 +766,11 @@ mod tests {
         assert_eq!(status_for("no_bottles"), StatusCode::BAD_REQUEST);
         assert_eq!(status_for("session_not_found"), StatusCode::NOT_FOUND);
         assert_eq!(status_for("session_expired"), StatusCode::GONE);
+        // The escrow club stage runs after Apple has accepted the passcode, so
+        // nothing about the caller's input was wrong. A 4xx here is exactly what
+        // sends a client back to asking the user to re-enter what already worked.
+        assert_eq!(status_for("escrow_club"), StatusCode::BAD_GATEWAY);
+        assert_ne!(status_for("escrow_club"), status_for("bad_passcode"));
         // Anything unrecognised is upstream's fault, not the caller's.
         assert_eq!(status_for("apple_error"), StatusCode::BAD_GATEWAY);
     }
@@ -894,6 +924,51 @@ mod tests {
         handle.abort();
         let err = handle.await.expect_err("task cancelled");
         assert!(join_failure(&err).starts_with("cancelled"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_pipeline_tells_the_user_which_step_died() {
+        // Production hit eight of these in four days, every one of them a bare
+        // `panic!()` inside the anisette client during Apple sign-in — and every
+        // one of them reached the user as "The export failed unexpectedly.",
+        // which names neither the step nor a next move. The panic's own message
+        // must stay out of the response; the step is the part that is both safe
+        // to hand over and worth handing over.
+        let session = spawn_session_with(Uuid::new_v4(), |_io| async move {
+            crate::logging::note_step(2);
+            panic!("explicit panic");
+        });
+        let mut rx = session.step_rx.clone();
+        let step = wait_for(&mut rx, Duration::from_secs(5), |s| matches!(s, Step::Failed { .. }))
+            .await
+            .expect("failed");
+        match step {
+            Step::Failed { error, detail } => {
+                assert_eq!(error, "apple_error");
+                assert!(detail.contains("signing in to Apple"), "{detail}");
+                assert!(!detail.contains("explicit panic"), "{detail}");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panic_before_the_first_step_claims_no_step() {
+        // The slot starts empty, and an invented step would be worse than none:
+        // it would send a support reply chasing a stage the run never entered.
+        let session = spawn_session_with(Uuid::new_v4(), |_io| async move {
+            panic!("explicit panic");
+        });
+        let mut rx = session.step_rx.clone();
+        let step = wait_for(&mut rx, Duration::from_secs(5), |s| matches!(s, Step::Failed { .. }))
+            .await
+            .expect("failed");
+        match step {
+            Step::Failed { detail, .. } => {
+                assert_eq!(detail, "The export failed unexpectedly.");
+            }
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]

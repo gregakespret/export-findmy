@@ -161,9 +161,9 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (a wrong password *or* a wrong 2FA code — Apple judged what was typed and
-rejected it), `bad_passcode`, `trust_circle_signature`, `bad_device_index`,
-`no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
-`apple_error`.
+rejected it), `bad_passcode`, `trust_circle_signature`, `escrow_club`,
+`bad_device_index`, `no_bottles`, `wrong_step`, `session_not_found`,
+`session_expired`, `apple_error`.
 
 A sign-in that fails *without* Apple ever judging the credentials — a non-2xx
 from a GSA endpoint, an anisette outage, an HTML error page where a plist was
@@ -176,8 +176,22 @@ own.
 `trust_circle_signature` (HTTP 409) is deliberately separate from
 `bad_passcode`: it means the escrow bottle decrypted — so the device passcode
 was correct — and the join then failed verifying one of the trust circle's
-signatures. Prompting for the passcode again cannot resolve it; the user should
-try a different trusted device. The server log names which signature failed.
+signatures. Prompting for the passcode again cannot resolve it. The server log
+names which signature failed, and `detail` names the way out, which depends on
+the account: with another trusted device, try that one; with only one, there is
+nothing to switch to and `detail` says so instead of asking for a device that
+does not exist.
+
+`escrow_club` (HTTP 502) is separate from `bad_passcode` for the same reason and
+with more certainty. Apple's escrow proxy serves two stages: `srp_init` /
+`recover`, which is where the device passcode is actually checked, and
+`get_club_cert` / `enroll`, which deposit the *new* escrow record this tool
+creates once it is already inside the circle. A failure in the second — Apple
+labels them `CLUBH ERROR`, commonly with status `-6015` — is by construction
+past the passcode check, so the passcode was right. It is usually transient:
+the user should start the connection again rather than re-enter anything.
+Because nothing about the request was wrong, it is reported as an upstream 502;
+a 4xx here is what sends clients back to blaming the user's input.
 
 **It is also the one error that does not end the attempt.** When another device
 is available, `POST /escrow` answers with the session still live and the body
