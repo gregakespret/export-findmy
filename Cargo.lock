@@ -402,7 +402,7 @@ dependencies = [
 [[package]]
 name = "cloudkit-derive"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#ae2f1e0d1df2a730fff56f02c2c301dc027dd8f9"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#52858a68c863867271ace4528d632f3b6be72d69"
 dependencies = [
  "cloudkit-proto",
  "deluxe",
@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "cloudkit-proto"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#ae2f1e0d1df2a730fff56f02c2c301dc027dd8f9"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#52858a68c863867271ace4528d632f3b6be72d69"
 dependencies = [
  "base64 0.21.7",
  "disjoint_impls",
@@ -1418,7 +1418,7 @@ dependencies = [
 [[package]]
 name = "icloud_auth"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#ae2f1e0d1df2a730fff56f02c2c301dc027dd8f9"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#52858a68c863867271ace4528d632f3b6be72d69"
 dependencies = [
  "aes",
  "base64 0.13.1",
@@ -1681,7 +1681,7 @@ dependencies = [
 [[package]]
 name = "keystore"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#ae2f1e0d1df2a730fff56f02c2c301dc027dd8f9"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#52858a68c863867271ace4528d632f3b6be72d69"
 dependencies = [
  "aes-gcm",
  "openssl",
@@ -2024,7 +2024,7 @@ dependencies = [
 [[package]]
 name = "omnisette"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#ae2f1e0d1df2a730fff56f02c2c301dc027dd8f9"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#52858a68c863867271ace4528d632f3b6be72d69"
 dependencies = [
  "android-loader",
  "anyhow",
@@ -2745,7 +2745,7 @@ dependencies = [
 [[package]]
 name = "rustpush"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#ae2f1e0d1df2a730fff56f02c2c301dc027dd8f9"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#52858a68c863867271ace4528d632f3b6be72d69"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3065,7 +3065,7 @@ dependencies = [
 [[package]]
 name = "srp"
 version = "0.6.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#ae2f1e0d1df2a730fff56f02c2c301dc027dd8f9"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#52858a68c863867271ace4528d632f3b6be72d69"
 dependencies = [
  "base64 0.21.7",
  "digest",
