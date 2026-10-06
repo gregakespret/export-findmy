@@ -214,10 +214,12 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         // "log in to appleid.apple.com" is a decent guess rather than Apple's
         // instruction. The dropped payload is the reason the log keeps `{:?}`.
         //
-        // Only `ExtraStep` is reachable today: the other two are raised solely
-        // inside `AppleAccount::get_auth_extras`, which nothing in rustpush
-        // calls. They are listed because the match is exhaustive and this is
-        // where they belong the day it acquires a caller.
+        // The other two come from `AppleAccount::get_auth_extras`, which the
+        // login calls on every two-factor sign-in to pick the SMS phone.
+        // `HardwareKeyError` reaches us: the account has no trusted phone, so
+        // no SMS can succeed. `FailedGetting2FAConfig` does not — the login
+        // swallows it and sends the code to phone id 1 — and is listed only
+        // because the match is exhaustive.
         E::ExtraStep(_) | E::FailedGetting2FAConfig | E::HardwareKeyError => {
             PipelineError::Apple(format!("Apple sign-in failed: {e}"))
         }
