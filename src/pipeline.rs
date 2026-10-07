@@ -173,11 +173,11 @@ const LOGIN_ANISETTE: &str =
 /// case: "it says my password is wrong, but it isn't".
 ///
 /// The discriminator is the *raise site*, not the variant name. `AuthSrp` reads
-/// like a rejected password and is not one: all six of its sites are
-/// `if !res.status().is_success()` against a GSA endpoint (four on
-/// `gsa.apple.com`, two on `gsas.apple.com`), i.e. a non-2xx — and only the two
-/// in `send_2fa_to_devices` / `send_sms_2fa_to_devices` are even reachable from
-/// `login`. Apple rejects a password with a **200** carrying `ec != 0`, which
+/// like a rejected password and is not one: all five of its sites are
+/// `if !res.status().is_success()` against a GSA endpoint (three on
+/// `gsa.apple.com`, two on `gsas.apple.com`), i.e. a non-2xx — and only the one
+/// in `send_2fa_to_devices` is even reachable from `login`. A refused SMS send
+/// is `SmsSendFailed`, which carries Apple's reason. Apple rejects a password with a **200** carrying `ec != 0`, which
 /// arrives here as `AuthSrpWithMessage` — that is where -22406 "Enter the
 /// correct password for this Apple Account" comes from. `PlistError` is the
 /// same story one layer down: an HTML error page where a plist was promised.
@@ -223,6 +223,12 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         E::ExtraStep(_) | E::FailedGetting2FAConfig | E::HardwareKeyError => {
             PipelineError::Apple(format!("Apple sign-in failed: {e}"))
         }
+        // Apple refused to text the code, after it had accepted the password,
+        // so not `bad_credentials` either. Its Display is Apple's own reason
+        // when the response carried one (a send limit, a blocked number), else
+        // a fixed line naming the step; both beat `LOGIN_UPSTREAM`'s "wait a
+        // minute", which sent users into a retry loop Apple kept refusing.
+        E::SmsSendFailed { .. } => PipelineError::Apple(format!("Apple sign-in failed: {e}")),
         // Our own provisioning dependency, not Apple's service — see
         // `LOGIN_ANISETTE`.
         E::ErrorGettingAnisette(_) => PipelineError::Apple(LOGIN_ANISETTE.to_string()),
@@ -868,7 +874,8 @@ mod tests {
         // `LOGIN_UPSTREAM` is the load-bearing half — `contains(e)` alone holds
         // by construction of the arm and would still pass if the arm were
         // deleted into the generic bucket, which is the regression to catch.
-        for e in [E::ExtraStep("repair".into()), E::FailedGetting2FAConfig, E::HardwareKeyError] {
+        let sms = E::SmsSendFailed { status: 423, message: "Too many codes sent.".into() };
+        for e in [E::ExtraStep("repair".into()), E::FailedGetting2FAConfig, E::HardwareKeyError, sms] {
             let mapped = login_error(&e);
             assert_ne!(mapped.code(), "bad_credentials", "{e:?} must not blame the password");
             assert_eq!(mapped.code(), "apple_error");
