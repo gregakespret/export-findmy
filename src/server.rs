@@ -68,7 +68,7 @@ fn why_no_input(e: std::sync::mpsc::RecvTimeoutError) -> String {
 fn step_name(s: &Step) -> &'static str {
     match s {
         Step::Starting => "starting",
-        Step::AwaitingTfa => "awaiting_2fa",
+        Step::AwaitingTfa { .. } => "awaiting_2fa",
         Step::AwaitingEscrow { .. } => "awaiting_passcode",
         Step::Running => "running",
         Step::Done { .. } => "done",
@@ -97,7 +97,11 @@ fn join_failure(e: &tokio::task::JoinError) -> String {
 pub enum Step {
     /// Initial state, before login has determined whether 2FA is required.
     Starting,
-    AwaitingTfa,
+    AwaitingTfa {
+        /// Apple's masked number of the phone the code was texted to, passed
+        /// on so the client can say which phone to check.
+        sent_to: Option<String>,
+    },
     AwaitingEscrow {
         devices: Vec<DeviceInfo>,
         /// Which ask this is, counting from 1. A retry returns to this same
@@ -153,8 +157,8 @@ pub struct ServerInteract {
 }
 
 impl Interact for ServerInteract {
-    fn get_2fa_code(&self) -> String {
-        let _ = self.step_tx.send(Step::AwaitingTfa);
+    fn get_2fa_code(&self, sent_to: Option<&str>) -> String {
+        let _ = self.step_tx.send(Step::AwaitingTfa { sent_to: sent_to.map(str::to_string) });
         match tokio::task::block_in_place(|| {
             self.tfa_rx.lock().unwrap().recv_timeout(INPUT_TIMEOUT)
         }) {
@@ -376,10 +380,10 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
 /// `(keep_session, status, body)`. Pure, so the contract is unit-tested.
 fn start_outcome(id: Uuid, outcome: Option<Step>) -> (bool, StatusCode, serde_json::Value) {
     match outcome {
-        Some(Step::AwaitingTfa) => (
+        Some(Step::AwaitingTfa { sent_to }) => (
             true,
             StatusCode::CREATED,
-            json!({"session_id": id, "state": "awaiting_2fa"}),
+            json!({"session_id": id, "state": "awaiting_2fa", "sent_to": sent_to}),
         ),
         Some(Step::AwaitingEscrow { devices, .. }) => (
             true,
@@ -415,7 +419,7 @@ async fn submit_2fa(
     // awaiting_2fa") — a self-contradiction in the record meant to settle it.
     let (current, ready) = {
         let step = session.step_rx.borrow();
-        (step_name(&step), matches!(&*step, Step::AwaitingTfa))
+        (step_name(&step), matches!(&*step, Step::AwaitingTfa { .. }))
     };
     // Never the code itself; its length is what tells an empty submit from a
     // mistyped one, and both reach Apple as the same rejection.
@@ -426,7 +430,7 @@ async fn submit_2fa(
     }
     let _ = session.tfa_tx.send(body.code);
     let mut rx = session.step_rx.clone();
-    match wait_for(&mut rx, START_TIMEOUT, |s| !matches!(s, Step::AwaitingTfa)).await {
+    match wait_for(&mut rx, START_TIMEOUT, |s| !matches!(s, Step::AwaitingTfa { .. })).await {
         Some(Step::AwaitingEscrow { devices, .. }) => {
             slog!(id, "POST /2fa -> awaiting_passcode with {} device(s)", devices.len());
             (StatusCode::OK, Json(json!({"state": "awaiting_passcode", "devices": devices})))
@@ -764,7 +768,7 @@ mod tests {
     fn spawn_normal() -> Spawner {
         Arc::new(|id, _opts| {
             spawn_session_with(id, |io| async move {
-                let _code = io.get_2fa_code(); // parks until POST /2fa
+                let _code = io.get_2fa_code(None); // parks until POST /2fa
                 let idx =
                     io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
                 assert!(idx < 2);
@@ -868,7 +872,7 @@ mod tests {
         // the client was told it was on — the API calls AwaitingEscrow
         // "awaiting_passcode", so the log must too.
         assert_eq!(step_name(&Step::Starting), "starting");
-        assert_eq!(step_name(&Step::AwaitingTfa), "awaiting_2fa");
+        assert_eq!(step_name(&Step::AwaitingTfa { sent_to: None }), "awaiting_2fa");
         assert_eq!(step_name(&Step::AwaitingEscrow { devices: vec![], ask: 1, retry: None }),
                    "awaiting_passcode");
         assert_eq!(step_name(&Step::Running), "running");
@@ -933,7 +937,7 @@ mod tests {
         // step-machine wiring is tested without touching Apple.
         let id = Uuid::new_v4();
         let session = spawn_session_with(id, |io| async move {
-            let code = io.get_2fa_code();
+            let code = io.get_2fa_code(None);
             assert_eq!(code, "123456");
             let idx = io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
             assert_eq!(idx, 1);
@@ -974,7 +978,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bad_device_index_fails_the_session() {
         let session = spawn_session_with(Uuid::new_v4(), |io| async move {
-            io.get_2fa_code();
+            io.get_2fa_code(None);
             let idx = io.choose_bottle(&[test_device("only")])?; // index 5 is out of range
             let _ = io.get_passcode()?;
             Ok(vec![BeaconExport {
@@ -1009,11 +1013,18 @@ mod tests {
     fn start_outcome_maps_each_first_step() {
         let id = Uuid::new_v4();
 
-        // Normal: 2FA required.
-        let (keep, status, body) = start_outcome(id, Some(Step::AwaitingTfa));
+        // Normal: 2FA required. The masked phone is passed through so the
+        // client can tell the user which phone the code went to.
+        let sent_to = Some("+1 (•••) •••-••12".to_string());
+        let (keep, status, body) = start_outcome(id, Some(Step::AwaitingTfa { sent_to }));
         assert!(keep && status == StatusCode::CREATED);
         assert_eq!(body["state"], "awaiting_2fa");
+        assert_eq!(body["sent_to"], "+1 (•••) •••-••12");
         assert!(body.get("devices").is_none());
+
+        // Phone unknown: `null`, so the client falls back to generic wording.
+        let (_, _, body) = start_outcome(id, Some(Step::AwaitingTfa { sent_to: None }));
+        assert!(body["sent_to"].is_null());
 
         // 2FA skipped: device list returned directly so the client skips /2fa.
         let devices = vec![test_device("GYK3003QMY")];
