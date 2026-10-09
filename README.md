@@ -85,7 +85,7 @@ logged.
 
 | Method & path | Body | Response |
 |---|---|---|
-| `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa"}` — or `"awaiting_passcode"` + `devices` if Apple already trusts the session and skips 2FA |
+| `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa","sent_to"}` (`sent_to`: Apple's masked number of the phone the code was texted to, e.g. `"+1 (•••) •••-••12"`, or `null`) — or `"awaiting_passcode"` + `devices` if Apple already trusts the session and skips 2FA |
 | `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":[{"serial","name","model"},…]}` |
 | `POST /sessions/{id}/escrow` | `{"device_index","passcode"}` | `200 {"state":"done","beacons":[…]}` |
 | `GET /healthz` | — | `200 {"status":"ok"}` |

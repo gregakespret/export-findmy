@@ -148,8 +148,11 @@ fn beacon_to_plist(b: &BeaconExport) -> plist::Value {
 struct CliInteract;
 
 impl Interact for CliInteract {
-    fn get_2fa_code(&self) -> String {
-        eprint!("2FA code: ");
+    fn get_2fa_code(&self, sent_to: Option<&str>) -> String {
+        match sent_to {
+            Some(phone) => eprint!("2FA code (texted to {phone}): "),
+            None => eprint!("2FA code: "),
+        }
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
         input.trim().to_string()

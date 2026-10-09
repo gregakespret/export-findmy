@@ -247,9 +247,11 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
 /// Supplies the three inputs that arrive mid-login. Must be `Send + Sync` so the
 /// server can drive the pipeline from a spawned task (`&dyn Interact` is captured
 /// by the login closure). `get_2fa_code` returns `String` because rustpush's
-/// login closure is `Fn() -> String`; an empty string makes login fail cleanly.
+/// login closure is `Fn(Option<&str>) -> String`; an empty string makes login
+/// fail cleanly. `sent_to` is Apple's masked number of the phone the code was
+/// texted to (e.g. "+1 (•••) •••-••12"), `None` when rustpush could not tell.
 pub trait Interact: Send + Sync {
-    fn get_2fa_code(&self) -> String;
+    fn get_2fa_code(&self, sent_to: Option<&str>) -> String;
     fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError>;
     fn get_passcode(&self) -> Result<String, PipelineError>;
     /// A join failed in a way a *different* device can get past, and the
@@ -349,7 +351,7 @@ pub async fn run_export(
     let apple_id_clone = opts.apple_id.clone();
     let password_hash: Vec<u8> = Sha256::digest(opts.password.as_bytes()).to_vec();
     let appleid_closure = move || (apple_id_clone.clone(), password_hash.clone());
-    let tfa_closure = || io.get_2fa_code();
+    let tfa_closure = |sent_to: Option<&str>| io.get_2fa_code(sent_to);
 
     let account =
         AppleAccount::login(appleid_closure, tfa_closure, login_info, anisette_client.clone())
