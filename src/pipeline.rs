@@ -593,8 +593,9 @@ pub async fn run_export(
         .get_zone_encryption_config(&beacon_zone, &keychain, &FIND_MY_SERVICE)
         .await
         .map_err(|e| {
-            step_failed!("[6/7] zone encryption config", PipelineError::Apple,
-                         "Zone encryption config failed", e)
+            log!("!! FAILED at [6/7] zone encryption config after {:.1}s: {} [{:?}]",
+                 started.elapsed().as_secs_f32(), e, e);
+            zone_config_error(&e)
         })?;
 
     let mut beacon_records: HashMap<String, MasterBeaconRecord> = HashMap::new();
@@ -736,6 +737,31 @@ pub async fn run_export(
     // Move the accessories (and their secret key bytes) into the exports rather
     // than cloning — accessories is dropped right after.
     Ok(accessories.into_values().map(beacon_export).collect())
+}
+
+/// What the user reads when the join worked but the Find My key's keychain zone
+/// has no class key: rustpush skipped that zone's TLK share because it failed
+/// its signature check. Until rustpush returned `ZoneKeyMissing` this panicked
+/// the export task into "The export failed unexpectedly."
+const ZONE_KEY_MISSING: &str =
+    "Your device passcode worked and this connection joined your iCloud Keychain, \
+     but the Find My keys your other devices shared with it failed a signature \
+     check on our side, so they can't be read. This is not a wrong passcode. Try \
+     connecting with a different trusted device; if that fails the same way, the \
+     problem is ours, not your account's.";
+
+/// Which `PipelineError` a failed step-6 zone encryption config becomes.
+///
+/// A zone missing its key is the join's own signature fault reached one step
+/// later, so it takes the join's code and way out (another trusted device), not
+/// `apple_error`'s implication that Apple turned the request down.
+fn zone_config_error(e: &PushError) -> PipelineError {
+    match e {
+        PushError::ZoneKeyMissing(_) => {
+            PipelineError::TrustCircleSignature(ZONE_KEY_MISSING.into())
+        }
+        e => PipelineError::Apple(format!("Zone encryption config failed: {e}")),
+    }
 }
 
 fn beacon_export(acc: BeaconAccessory) -> BeaconExport {
@@ -941,5 +967,29 @@ mod tests {
         // Display is never empty — it becomes the JSON `detail`.
         assert!(!PipelineError::NoBottles.to_string().is_empty());
         assert!(!PipelineError::Aborted.to_string().is_empty());
+    }
+
+    /// Seven exports of one account in Oct 2026 joined the trust circle, then
+    /// panicked at step 6 because rustpush had skipped the Manatee TLK share
+    /// (it failed its signature check). The user read "The export failed
+    /// unexpectedly." under `apple_error`. Now that rustpush returns
+    /// `ZoneKeyMissing`, it must reach the user as the signature fault it is.
+    #[test]
+    fn a_zone_missing_its_key_is_a_signature_fault_not_apples() {
+        let mapped = zone_config_error(&PushError::ZoneKeyMissing("Manatee".into()));
+        assert_eq!(mapped.code(), TRUST_CIRCLE_SIGNATURE);
+        assert_eq!(mapped.to_string(), ZONE_KEY_MISSING);
+        assert!(
+            mapped.to_string().contains("not a wrong passcode"),
+            "{mapped}"
+        );
+
+        // Any other failure here is still Apple's, with rustpush's own text kept.
+        let other = zone_config_error(&PushError::NotInClique);
+        assert_eq!(other.code(), "apple_error");
+        assert_eq!(
+            other.to_string(),
+            "Zone encryption config failed: Not in clique!"
+        );
     }
 }
