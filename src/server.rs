@@ -286,9 +286,19 @@ where
                     // the session it killed.
                     slog!(id, "export task {} after {:.1}s",
                           join_failure(&e), started.elapsed().as_secs_f32());
+                    // A panic is our bug, so not `apple_error`: that sent the
+                    // search to Apple, and the old "failed unexpectedly" left a
+                    // user who had just typed their passcode to assume it was
+                    // wrong. A cancellation lands here too, but every abort
+                    // retires the session right after, so no handler is left to
+                    // report it.
                     Step::Failed {
-                        error: "apple_error",
-                        detail: "The export failed unexpectedly.".into(),
+                        error: "extractor_panic",
+                        detail: "Something went wrong on our side and the export \
+                                 stopped. This is not a problem with your Apple ID, \
+                                 password or passcode, so entering them again won't \
+                                 help. Please try again later."
+                            .into(),
                     }
                 }
             };
@@ -757,6 +767,11 @@ mod tests {
         assert_eq!(status_for("session_expired"), StatusCode::GONE);
         // Anything unrecognised is upstream's fault, not the caller's.
         assert_eq!(status_for("apple_error"), StatusCode::BAD_GATEWAY);
+        // Split out of `apple_error` by code only: retyping fixes none of them,
+        // and a client that switches on status must see no change.
+        for code in ["sms_refused", "anisette_unavailable", "extractor_panic"] {
+            assert_eq!(status_for(code), StatusCode::BAD_GATEWAY, "{code}");
+        }
     }
 
     fn state_with(spawn: Spawner) -> AppState {
@@ -908,6 +923,29 @@ mod tests {
         handle.abort();
         let err = handle.await.expect_err("task cancelled");
         assert!(join_failure(&err).starts_with("cancelled"));
+    }
+
+    /// Production's panics ("Insert class key not found") came after the user
+    /// had typed the device passcode, and were reported as `apple_error` "The
+    /// export failed unexpectedly." — Apple blamed for our bug, and nothing
+    /// telling the user their passcode was fine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_export_is_reported_as_ours_not_apples() {
+        let session = spawn_session_with(Uuid::new_v4(), |_io| async move {
+            panic!("Insert class key not found")
+        });
+        let mut rx = session.step_rx.clone();
+        let step = wait_for(&mut rx, Duration::from_secs(5), |s| matches!(s, Step::Failed { .. }))
+            .await
+            .expect("a panic still ends the session instead of hanging it");
+        match step {
+            Step::Failed { error, detail } => {
+                assert_eq!(error, "extractor_panic");
+                assert!(detail.contains("on our side"), "{detail}");
+                assert!(detail.contains("not a problem with your"), "{detail}");
+            }
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]

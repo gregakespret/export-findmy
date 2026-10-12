@@ -124,6 +124,18 @@ pub enum PipelineError {
     DeviceNoShares(String),
     BadDeviceIndex(String),
     NoBottles,
+    /// Apple accepted the password, then refused to text the 2FA code: a 423 on
+    /// `PUT /auth/verify/phone`, its "This phone number cannot be used at this
+    /// time" and "Enter the last code you received or try again later". Kept
+    /// apart from `Apple` because nothing on either side is broken — the number
+    /// is under a send limit only time lifts, and an immediate retry is refused
+    /// the same way (production saw four in one minute) — so a client should
+    /// tell the user to wait, not page whoever runs it.
+    SmsRefused(String),
+    /// Our anisette provisioning host failed — see [`LOGIN_ANISETTE`]. Not
+    /// `Apple`: a client that reads `apple_error` as "Apple is refusing us"
+    /// looks for the outage in the wrong place.
+    AnisetteUnavailable,
     Apple(String),
     Aborted,
 }
@@ -140,6 +152,8 @@ impl PipelineError {
             PipelineError::DeviceNoShares(_) => "device_no_shares",
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
             PipelineError::NoBottles => "no_bottles",
+            PipelineError::SmsRefused(_) => "sms_refused",
+            PipelineError::AnisetteUnavailable => "anisette_unavailable",
             PipelineError::Apple(_) => "apple_error",
             // Aborted is a local input timeout/cancellation, not an Apple fault —
             // the attempt lapsed, so report it as an expired session (410).
@@ -161,6 +175,8 @@ impl std::fmt::Display for PipelineError {
             PipelineError::NoBottles => {
                 write!(f, "No escrow bottles found. Make sure you have another trusted device.")
             }
+            PipelineError::SmsRefused(m) => write!(f, "{m}"),
+            PipelineError::AnisetteUnavailable => write!(f, "{LOGIN_ANISETTE}"),
             PipelineError::Apple(m) => write!(f, "{m}"),
             PipelineError::Aborted => write!(f, "The connection attempt was cancelled."),
         }
@@ -374,10 +390,21 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         // when the response carried one (a send limit, a blocked number), else
         // a fixed line naming the step; both beat `LOGIN_UPSTREAM`'s "wait a
         // minute", which sent users into a retry loop Apple kept refusing.
+        //
+        // Only a 423 is `sms_refused`: it is the status every refusal in the
+        // production logs carried, and the one that means "locked", not
+        // "broken". Any other status could be Apple's endpoint failing, so it
+        // stays `apple_error` and still alerts.
+        E::SmsSendFailed { status: 423, message } => PipelineError::SmsRefused(format!(
+            "Apple won't text a verification code to your phone right now. Apple \
+             said: \"{message}\" This is a limit on Apple's side, not a problem \
+             with your Apple ID or password, so trying again straight away won't \
+             help. Please wait a few hours, then try again."
+        )),
         E::SmsSendFailed { .. } => PipelineError::Apple(format!("Apple sign-in failed: {e}")),
         // Our own provisioning dependency, not Apple's service — see
         // `LOGIN_ANISETTE`.
-        E::ErrorGettingAnisette(_) => PipelineError::Apple(LOGIN_ANISETTE.to_string()),
+        E::ErrorGettingAnisette(_) => PipelineError::AnisetteUnavailable,
         // Transport or a response we could not parse — nothing about the
         // user's input. The variant and its payload are in the log line above;
         // the user gets a sentence they can act on instead.
@@ -1061,7 +1088,9 @@ mod tests {
         // `LOGIN_UPSTREAM` is the load-bearing half — `contains(e)` alone holds
         // by construction of the arm and would still pass if the arm were
         // deleted into the generic bucket, which is the regression to catch.
-        let sms = E::SmsSendFailed { status: 423, message: "Too many codes sent.".into() };
+        // A refused SMS send at any status but 423 belongs here too: it may be
+        // Apple's endpoint failing rather than a limit, so it must keep alerting.
+        let sms = E::SmsSendFailed { status: 400, message: "Not allowed".into() };
         for e in [E::ExtraStep("repair".into()), E::FailedGetting2FAConfig, E::HardwareKeyError, sms] {
             let mapped = login_error(&e);
             assert_ne!(mapped.code(), "bad_credentials", "{e:?} must not blame the password");
@@ -1081,10 +1110,37 @@ mod tests {
             omnisette::AnisetteError::AnisetteNotProvisioned,
         );
         let mapped = login_error(&e);
-        assert_eq!(mapped.code(), "apple_error");
-        assert_ne!(mapped.code(), "bad_credentials");
+        // Its own code, so a client can tell "our host is down" from "Apple is
+        // refusing us" without parsing the sentence.
+        assert_eq!(mapped.code(), "anisette_unavailable");
         assert_ne!(mapped.to_string(), LOGIN_UPSTREAM, "anisette is not Apple's service");
         assert_eq!(mapped.to_string(), LOGIN_ANISETTE);
+    }
+
+    /// Apple's send limit is not an outage. Reported as `apple_error`, every
+    /// throttled number paged whoever runs the extractor for something only
+    /// time fixes, and the user's own retries — four in one minute in the
+    /// production log — were each refused the same way. The messages are the
+    /// two Apple actually sent, verbatim.
+    #[test]
+    fn login_error_reports_apples_sms_send_limit_as_its_own_code() {
+        use icloud_auth::Error as E;
+        for message in [
+            "This phone number cannot be used at this time. Try again later or choose a different number.",
+            "Enter the last code you received or try again later.",
+        ] {
+            let e = E::SmsSendFailed { status: 423, message: message.into() };
+            let mapped = login_error(&e);
+            assert_eq!(mapped.code(), "sms_refused", "{e:?}");
+            let detail = mapped.to_string();
+            // Apple's own reason survives — "choose a different number" is a
+            // way out we cannot offer ourselves.
+            assert!(detail.contains(message), "{detail}");
+            // The user is told to wait, and that retyping cannot help: the two
+            // things the old "Apple sign-in failed" wording did not say.
+            assert!(detail.contains("wait"), "{detail}");
+            assert!(detail.contains("not a problem with your Apple ID or password"), "{detail}");
+        }
     }
 
     /// The other half: a genuinely wrong password must still say so, or the fix
@@ -1253,11 +1309,14 @@ mod tests {
         );
         assert_eq!(PipelineError::BadDeviceIndex("x".into()).code(), "bad_device_index");
         assert_eq!(PipelineError::NoBottles.code(), "no_bottles");
+        assert_eq!(PipelineError::SmsRefused("x".into()).code(), "sms_refused");
+        assert_eq!(PipelineError::AnisetteUnavailable.code(), "anisette_unavailable");
         assert_eq!(PipelineError::Apple("x".into()).code(), "apple_error");
         // A local input timeout is not Apple's fault.
         assert_eq!(PipelineError::Aborted.code(), "session_expired");
         // Display is never empty — it becomes the JSON `detail`.
         assert!(!PipelineError::NoBottles.to_string().is_empty());
+        assert!(!PipelineError::AnisetteUnavailable.to_string().is_empty());
         assert!(!PipelineError::Aborted.to_string().is_empty());
     }
 }
