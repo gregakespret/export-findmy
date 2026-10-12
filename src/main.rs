@@ -7,6 +7,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use icloud_auth::CodeSentTo;
 use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore}};
 use plist::Dictionary;
 
@@ -148,10 +149,13 @@ fn beacon_to_plist(b: &BeaconExport) -> plist::Value {
 struct CliInteract;
 
 impl Interact for CliInteract {
-    fn get_2fa_code(&self, sent_to: Option<&str>) -> String {
+    fn get_2fa_code(&self, sent_to: CodeSentTo) -> String {
         match sent_to {
-            Some(phone) => eprint!("2FA code (texted to {phone}): "),
-            None => eprint!("2FA code: "),
+            CodeSentTo::Sms(Some(phone)) => eprint!("2FA code (texted to {phone}): "),
+            CodeSentTo::Sms(None) => eprint!("2FA code: "),
+            CodeSentTo::TrustedDevice => eprint!(
+                "Apple would not text the code. Tap Allow on the sign-in popup on your iPhone, iPad or Mac and enter the code it shows: "
+            ),
         }
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();

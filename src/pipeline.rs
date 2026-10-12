@@ -10,6 +10,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use icloud_auth::CodeSentTo;
 use omnisette::remote_anisette_v3::RemoteAnisetteProviderV3;
 use omnisette::{AnisetteClient, ArcAnisetteClient};
 use sha2::{Digest, Sha256};
@@ -228,6 +229,8 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         // when the response carried one (a send limit, a blocked number), else
         // a fixed line naming the step; both beat `LOGIN_UPSTREAM`'s "wait a
         // minute", which sent users into a retry loop Apple kept refusing.
+        // The login no longer returns it for a refusal: it asks for the
+        // trusted-device code instead (`CodeSentTo::TrustedDevice`).
         E::SmsSendFailed { .. } => PipelineError::Apple(format!("Apple sign-in failed: {e}")),
         // Our own provisioning dependency, not Apple's service — see
         // `LOGIN_ANISETTE`.
@@ -247,11 +250,12 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
 /// Supplies the three inputs that arrive mid-login. Must be `Send + Sync` so the
 /// server can drive the pipeline from a spawned task (`&dyn Interact` is captured
 /// by the login closure). `get_2fa_code` returns `String` because rustpush's
-/// login closure is `Fn(Option<&str>) -> String`; an empty string makes login
-/// fail cleanly. `sent_to` is Apple's masked number of the phone the code was
-/// texted to (e.g. "+1 (•••) •••-••12"), `None` when rustpush could not tell.
+/// login closure is `Fn(CodeSentTo) -> String`; an empty string makes login
+/// fail cleanly. `sent_to` says which code Apple is waiting for: a text, with
+/// Apple's masked number of the phone it went to (e.g. "+1 (•••) •••-••12") when
+/// rustpush could tell, or the trusted-device popup when Apple refused to text it.
 pub trait Interact: Send + Sync {
-    fn get_2fa_code(&self, sent_to: Option<&str>) -> String;
+    fn get_2fa_code(&self, sent_to: CodeSentTo) -> String;
     fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError>;
     fn get_passcode(&self) -> Result<String, PipelineError>;
     /// A join failed in a way a *different* device can get past, and the
@@ -351,7 +355,7 @@ pub async fn run_export(
     let apple_id_clone = opts.apple_id.clone();
     let password_hash: Vec<u8> = Sha256::digest(opts.password.as_bytes()).to_vec();
     let appleid_closure = move || (apple_id_clone.clone(), password_hash.clone());
-    let tfa_closure = |sent_to: Option<&str>| io.get_2fa_code(sent_to);
+    let tfa_closure = |sent_to: CodeSentTo| io.get_2fa_code(sent_to);
 
     let account =
         AppleAccount::login(appleid_closure, tfa_closure, login_info, anisette_client.clone())
