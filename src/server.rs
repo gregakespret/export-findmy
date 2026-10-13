@@ -78,9 +78,9 @@ fn step_name(s: &Step) -> &'static str {
 }
 
 /// What a pipeline task's `JoinError` says. A panic (an `unwrap` on unexpected
-/// Apple data) is reported to the user as "failed unexpectedly"; without the
-/// payload here, nothing ties the panic printed by the runtime to the session
-/// it killed.
+/// Apple data) is reported to the user as `extractor_panic` with a fixed
+/// sentence; without the payload here, nothing ties the panic printed by the
+/// runtime to the session it killed.
 fn join_failure(e: &tokio::task::JoinError) -> String {
     // JoinError's Display already carries the panic's own message ("task 12
     // panicked with message \"...\""), which is the only description of the
@@ -286,19 +286,27 @@ where
                     // the session it killed.
                     slog!(id, "export task {} after {:.1}s",
                           join_failure(&e), started.elapsed().as_secs_f32());
-                    // A panic is our bug, so not `apple_error`: that sent the
-                    // search to Apple, and the old "failed unexpectedly" left a
-                    // user who had just typed their passcode to assume it was
-                    // wrong. A cancellation lands here too, but every abort
-                    // retires the session right after, so no handler is left to
-                    // report it.
-                    Step::Failed {
-                        error: "extractor_panic",
-                        detail: "Something went wrong on our side and the export \
-                                 stopped. This is not a problem with your Apple ID, \
-                                 password or passcode, so entering them again won't \
-                                 help. Please try again later."
-                            .into(),
+                    if e.is_cancelled() {
+                        // Our own abort, not a bug. Retiring the session only
+                        // drops it from the map: a second request already
+                        // waiting on it (a double-submitted /2fa whose twin
+                        // timed out and aborted) is still handed this step, and
+                        // `extractor_panic` would page us for a timeout.
+                        let aborted = PipelineError::Aborted;
+                        Step::Failed { error: aborted.code(), detail: aborted.to_string() }
+                    } else {
+                        // A panic is our bug, so not `apple_error`: that sent the
+                        // search to Apple, and the old "failed unexpectedly" left a
+                        // user who had just typed their passcode to assume it was
+                        // wrong.
+                        Step::Failed {
+                            error: "extractor_panic",
+                            detail: "Something went wrong on our side and the export \
+                                     stopped. This is not a problem with your Apple ID, \
+                                     password or passcode, so entering them again won't \
+                                     help. Please try again later."
+                                .into(),
+                        }
                     }
                 }
             };
@@ -910,8 +918,8 @@ mod tests {
 
     #[tokio::test]
     async fn join_failure_keeps_the_panic_message() {
-        // A panicking pipeline is reported to the user as "failed unexpectedly";
-        // this string is the only record of what actually blew up.
+        // A panicking pipeline is reported to the user as `extractor_panic` with
+        // a fixed sentence; this string is the only record of what blew up.
         let err = tokio::spawn(async { panic!("unexpected CloudKit record") })
             .await
             .expect_err("task panicked");
@@ -944,6 +952,26 @@ mod tests {
                 assert!(detail.contains("on our side"), "{detail}");
                 assert!(detail.contains("not a problem with your"), "{detail}");
             }
+            _ => panic!(),
+        }
+    }
+
+    /// An aborted export is a lapsed attempt, not a panic. A handler still
+    /// waiting on the session when another handler aborts it (a double submit)
+    /// reports whatever lands here, and `extractor_panic` would alert on a
+    /// timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_export_is_not_reported_as_a_panic() {
+        let session = spawn_session_with(Uuid::new_v4(), |_io| async move {
+            std::future::pending::<Result<Vec<BeaconExport>, PipelineError>>().await
+        });
+        session.abort.abort();
+        let mut rx = session.step_rx.clone();
+        let step = wait_for(&mut rx, Duration::from_secs(5), |s| matches!(s, Step::Failed { .. }))
+            .await
+            .expect("an abort still ends the session");
+        match step {
+            Step::Failed { error, .. } => assert_eq!(error, "session_expired"),
             _ => panic!(),
         }
     }

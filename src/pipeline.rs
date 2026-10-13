@@ -557,7 +557,7 @@ pub async fn run_export(
             })?;
 
     // These three were `expect`/`unwrap`: a panic unwinding out of the pipeline
-    // task, which the server can only report as "failed unexpectedly" with no
+    // task, which the server can only report as `extractor_panic` with no step
     // attribution. A login that returns no SPD is a real (if rare) Apple
     // response, so it gets a logged, attributable failure like any other.
     // `spd["DsPrsId"]` would be the same panic by another route — plist's
@@ -818,9 +818,9 @@ pub async fn run_export(
     // `.remove(0)` and the per-change field accesses below were unwraps on data
     // Apple controls — the least predictable input in the whole pipeline, and
     // the panic source `spawn_session_with` names when it explains why the
-    // pipeline runs on its own task. A panic here reaches the user as "The
-    // export failed unexpectedly." with no step attribution at all, which is
-    // the failure class this instrumentation exists to remove.
+    // pipeline runs on its own task. A panic here reaches the user as
+    // `extractor_panic` with no step attribution at all, which is the failure
+    // class this instrumentation exists to remove.
     let mut zones = result.map_err(|e| {
         step_failed!("[6/7] CloudKit fetch", PipelineError::Apple, "CloudKit fetch failed", e)
     })?;
