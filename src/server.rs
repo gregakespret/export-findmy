@@ -739,6 +739,9 @@ mod tests {
         // into each other — a 4xx that reads as "fix your input" is wrong for a
         // failure the user's input cannot fix.
         assert_eq!(status_for("bad_credentials"), StatusCode::UNAUTHORIZED);
+        // Apple refusing the sign-in is not the caller's to fix, so not the
+        // 401 that `bad_credentials` gets.
+        assert_eq!(status_for("signin_refused"), StatusCode::BAD_GATEWAY);
         assert_eq!(status_for("bad_passcode"), StatusCode::BAD_REQUEST);
         assert_eq!(status_for("trust_circle_signature"), StatusCode::CONFLICT);
         assert_eq!(status_for("bad_device_index"), StatusCode::BAD_REQUEST);

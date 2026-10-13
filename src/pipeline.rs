@@ -98,6 +98,14 @@ pub enum PipelineError {
     /// of here: this variant is a 401, and a 401 tells the user to go and
     /// retype something, which is wrong advice for any of those.
     BadCredentials(String),
+    /// Apple turned the sign-in itself away with -80045 "This action cannot be
+    /// completed at this time." — not a verdict on the password (that is
+    /// -22406), and nothing the user can retype past. Since 2026-10-13 Apple
+    /// has answered every sign-in from this tool this way, and AltServer,
+    /// Sideloadly and xtool with it. Kept apart from `BadCredentials`, which
+    /// is a 401 that client alerting reads as user error, so a refusal of
+    /// every sign-in read green for a day.
+    SigninRefused(String),
     BadPasscode(String),
     /// The trust-circle join failed a *signature* check, not the passcode. Kept
     /// apart from `BadPasscode` because the two need opposite advice: this one
@@ -116,6 +124,7 @@ impl PipelineError {
     pub fn code(&self) -> &'static str {
         match self {
             PipelineError::BadCredentials(_) => "bad_credentials",
+            PipelineError::SigninRefused(_) => "signin_refused",
             PipelineError::BadPasscode(_) => "bad_passcode",
             PipelineError::TrustCircleSignature(_) => TRUST_CIRCLE_SIGNATURE,
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
@@ -132,6 +141,7 @@ impl std::fmt::Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PipelineError::BadCredentials(m) => write!(f, "{m}"),
+            PipelineError::SigninRefused(m) => write!(f, "{m}"),
             PipelineError::BadPasscode(m) => write!(f, "{m}"),
             PipelineError::TrustCircleSignature(m) => write!(f, "{m}"),
             PipelineError::BadDeviceIndex(m) => write!(f, "{m}"),
@@ -190,6 +200,15 @@ const LOGIN_ANISETTE: &str =
 fn login_error(e: &icloud_auth::Error) -> PipelineError {
     use icloud_auth::Error as E;
     match e {
+        // The one `ec` that is not about the credentials: Apple refusing the
+        // sign-in outright, at either SRP round trip. Since the refusal can
+        // come before Apple checks the password, the detail says this is not
+        // Apple calling the password wrong, not that the password is right.
+        E::AuthSrpWithMessage(-80045, message) => PipelineError::SigninRefused(format!(
+            "Apple is refusing sign-ins from tools like this one right now. Apple \
+             said: \"{message}\" This is not Apple saying your password is wrong, \
+             so entering it again won't help. Please try again later."
+        )),
         // Apple looked at the credentials and said no: `check_error` raises
         // `AuthSrpWithMessage` on a 200 with `ec != 0`, carrying wording more
         // specific than anything we would write (locked account, wrong
@@ -922,9 +941,33 @@ mod tests {
         assert_eq!(login_error(&E::Bad2faCode).code(), "bad_credentials");
     }
 
+    /// From 2026-10-13 00:40 UTC Apple answered every sign-in with -80045, and
+    /// as `bad_credentials` it was a 401 that the client's alerting counts as
+    /// user error: no sign-in got through for a day while the alerts stayed
+    /// green, and each user was told their password was wrong. The message is
+    /// verbatim from the production log.
+    #[test]
+    fn login_error_reports_apple_refusing_the_sign_in_as_its_own_code() {
+        use icloud_auth::Error as E;
+        let e = E::AuthSrpWithMessage(-80045, "This action cannot be completed at this time.".into());
+        let mapped = login_error(&e);
+        assert_eq!(mapped.code(), "signin_refused");
+        let detail = mapped.to_string();
+        assert!(detail.contains("This action cannot be completed at this time."), "{detail}");
+        // What the old wording could not say: retyping cannot help, and the
+        // way out is time.
+        assert!(detail.contains("not Apple saying your password is wrong"), "{detail}");
+        assert!(detail.contains("try again later"), "{detail}");
+        // Only -80045 moves: every other `ec` is still Apple's verdict on what
+        // was typed.
+        let other = E::AuthSrpWithMessage(-20101, "Your Apple ID or password was incorrect.".into());
+        assert_eq!(login_error(&other).code(), "bad_credentials");
+    }
+
     #[test]
     fn pipeline_error_codes_and_messages() {
         assert_eq!(PipelineError::BadCredentials("x".into()).code(), "bad_credentials");
+        assert_eq!(PipelineError::SigninRefused("x".into()).code(), "signin_refused");
         assert_eq!(PipelineError::BadPasscode("x".into()).code(), "bad_passcode");
         // Distinct from bad_passcode on purpose: a client that tells the user to
         // re-enter their passcode here would be telling them to retry the one
