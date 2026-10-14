@@ -895,6 +895,7 @@ dependencies = [
  "plist",
  "pretty_env_logger",
  "rand 0.8.6",
+ "reqwest",
  "rustpush",
  "serde",
  "serde_json",

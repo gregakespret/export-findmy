@@ -20,6 +20,7 @@ use serde_json::json;
 use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
+use crate::anisette::AnisetteServer;
 use crate::pipeline::{run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError};
 
 const INPUT_TIMEOUT: Duration = Duration::from_secs(600); // pipeline waits on the user
@@ -228,7 +229,7 @@ type Spawner = Arc<dyn Fn(Uuid, ExportOpts) -> Arc<Session> + Send + Sync>;
 struct AppState {
     sessions: Arc<Mutex<HashMap<Uuid, Arc<Session>>>>,
     expired: Arc<Mutex<HashSet<Uuid>>>,
-    anisette_url: Arc<String>,
+    anisette: Arc<AnisetteServer>,
     spawn: Spawner,
 }
 
@@ -338,7 +339,7 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
     let opts = ExportOpts {
         apple_id: body.apple_id,
         password: body.password,
-        anisette_url: (*st.anisette_url).clone(),
+        anisette: (*st.anisette).clone(),
         debug: false,
         session_id: tag(id),
     };
@@ -710,11 +711,11 @@ async fn reap_loop(st: AppState) {
     }
 }
 
-pub async fn serve(port: u16, anisette_url: String) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn serve(port: u16, anisette: AnisetteServer) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         expired: Arc::new(Mutex::new(HashSet::new())),
-        anisette_url: Arc::new(anisette_url),
+        anisette: Arc::new(anisette),
         spawn: Arc::new(spawn_session),
     };
     tokio::spawn(reap_loop(state.clone()));
@@ -756,7 +757,7 @@ mod tests {
         AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             expired: Arc::new(Mutex::new(HashSet::new())),
-            anisette_url: Arc::new("https://example".into()),
+            anisette: Arc::new(AnisetteServer::V3("https://example".into())),
             spawn,
         }
     }

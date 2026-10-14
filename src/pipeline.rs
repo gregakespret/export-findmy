@@ -10,7 +10,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use omnisette::remote_anisette_v3::RemoteAnisetteProviderV3;
 use omnisette::{AnisetteClient, ArcAnisetteClient};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -30,6 +29,7 @@ use rustpush::{
     OSConfig, PushError, TokenProvider,
 };
 
+use crate::anisette::{AnisetteServer, Provider};
 use crate::logging;
 use crate::FakeIOSConfig;
 
@@ -290,7 +290,7 @@ const MAX_JOIN_ATTEMPTS: usize = 3;
 pub struct ExportOpts {
     pub apple_id: String,
     pub password: String,
-    pub anisette_url: String,
+    pub anisette: AnisetteServer,
     pub debug: bool,
     /// Short tag identifying this run in the log. In `--serve` this is the
     /// session id the HTTP API handed the caller, so a line here can be joined
@@ -298,6 +298,15 @@ pub struct ExportOpts {
     /// One Apple ID can have two attempts in flight (a user who retries), and
     /// their lines interleave — the Apple ID prefix alone doesn't separate them.
     pub session_id: String,
+}
+
+/// Signs in as the Mac a headers server named. Apple accepted that Mac's
+/// anisette under every identity tried, but only the matching one is what a
+/// real Mac sends; the Android ADI it replaces is what Apple refuses (-80045).
+fn claim_anisette_machine(mut info: omnisette::LoginClientInfo, identity: &str) -> omnisette::LoginClientInfo {
+    info.mme_client_info = identity.into();
+    info.mme_client_info_akd = identity.into();
+    info
 }
 
 pub async fn run_export(
@@ -352,18 +361,27 @@ pub async fn run_export(
     // The anisette server is third-party and has broken before; naming which
     // one this run used is the difference between "Apple rejected us" and "our
     // provisioning host was down".
-    log!("[1/7] Connecting to anisette server ({})...", opts.anisette_url);
+    log!("[1/7] Connecting to anisette server ({})...", opts.anisette);
     let anisette_config_path = PathBuf::from_str("anisette_state").unwrap();
     std::fs::create_dir_all(&anisette_config_path).ok();
 
-    let login_info = config.get_gsa_config(&APSState::default(), false);
+    let mut login_info = config.get_gsa_config(&APSState::default(), false);
 
-    let anisette_client: ArcAnisetteClient<RemoteAnisetteProviderV3> =
-        Arc::new(Mutex::new(AnisetteClient::new(RemoteAnisetteProviderV3::new(
-            opts.anisette_url.clone(),
-            login_info.clone(),
-            anisette_config_path,
-        ))));
+    let anisette_client: ArcAnisetteClient<Provider> = Arc::new(Mutex::new(AnisetteClient::new(
+        Provider::new(&opts.anisette, login_info.clone(), anisette_config_path),
+    )));
+    if let AnisetteServer::Headers(_) = &opts.anisette {
+        let identity = anisette_client.lock().await.get_headers().await
+            .map(|headers| headers["X-Mme-Client-Info"].clone())
+            .map_err(|e| {
+                log!("!! FAILED at [1/7] anisette after {:.1}s: {} [{:?}]",
+                     started.elapsed().as_secs_f32(), e, e);
+                PipelineError::Apple(LOGIN_ANISETTE.to_string())
+            })?;
+        // Device model and OS only: which identity Apple was shown.
+        log!("  Signing in as anisette machine {}", identity);
+        login_info = claim_anisette_machine(login_info, &identity);
+    }
 
     // ── Step 2: Login to Apple ──────────────────────────────────────
     log!("[2/7] Logging in to Apple ID...");
@@ -794,6 +812,19 @@ fn rfc3339_secs(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the sign-in identity changes: the service requests that follow keep
+    /// FakeIOSConfig's iPhone identity and iosbuddy endpoint, as before 2026-10-13.
+    #[test]
+    fn headers_server_sign_in_claims_the_anisette_machine() {
+        let service = FakeIOSConfig::new();
+        let before = service.get_gsa_config(&APSState::default(), false);
+        let mac = "<Mac17,4> <macOS;26.5;25F71> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+        let auth = claim_anisette_machine(before.clone(), mac);
+        assert_eq!((auth.mme_client_info.as_str(), auth.mme_client_info_akd.as_str()), (mac, mac));
+        assert_eq!(auth.akd_user_agent, before.akd_user_agent);
+        assert_eq!(service.get_login_url(), "https://setup.icloud.com/setup/iosbuddy/loginDelegates");
+    }
 
     fn md(pairs: &[(&str, &str)]) -> plist::Value {
         let mut d = plist::Dictionary::new();

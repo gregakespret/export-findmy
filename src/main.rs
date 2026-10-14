@@ -1,3 +1,4 @@
+mod anisette;
 mod logging;
 mod pipeline;
 mod server;
@@ -12,6 +13,7 @@ use plist::Dictionary;
 
 use rustpush::{ActivationInfo, DebugMeta, OSConfig, PushError, RegisterMeta};
 
+use anisette::AnisetteServer;
 use pipeline::{run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError};
 
 // ── Fake OSConfig (presents as iPhone to avoid NAS validation) ───────
@@ -253,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut apple_id = String::new();
-    let mut anisette_url = "https://ani.sidestore.io".to_string();
+    let mut anisette = AnisetteServer::V3("https://ani.sidestore.io".to_string());
     let mut output_dir = PathBuf::from(".");
     let mut debug = false;
     let mut serve = false;
@@ -272,8 +274,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--anisette-url" => {
                 i += 1;
                 match args.get(i) {
-                    Some(v) => anisette_url = v.clone(),
+                    Some(v) => anisette = AnisetteServer::V3(v.clone()),
                     None => return arg_err("--anisette-url"),
+                }
+            }
+            "--anisette-headers-url" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => anisette = AnisetteServer::Headers(v.clone()),
+                    None => return arg_err("--anisette-headers-url"),
                 }
             }
             "--output-dir" => {
@@ -305,6 +314,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Options:");
                 eprintln!("  --apple-id <email>       Apple ID email");
                 eprintln!("  --anisette-url <url>     Anisette server URL (default: https://ani.sidestore.io)");
+                eprintln!("  --anisette-headers-url <url>");
+                eprintln!("                           Server returning a Mac's anisette headers as JSON on GET;");
+                eprintln!("                           replaces --anisette-url");
                 eprintln!("  --output-dir <dir>       Output directory for plist files (default: .)");
                 eprintln!("  --debug                  Print CloudKit record-type breakdown and per-record details");
                 eprintln!("  --serve                  Run the localhost REST API instead of the CLI export");
@@ -323,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if serve {
-        return server::serve(port, anisette_url).await;
+        return server::serve(port, anisette).await;
     }
 
     if apple_id.is_empty() {
@@ -342,7 +354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let beacons = logging::scope(
         "cli".to_string(),
         run_export(
-            ExportOpts { apple_id, password, anisette_url, debug, session_id: "cli".to_string() },
+            ExportOpts { apple_id, password, anisette, debug, session_id: "cli".to_string() },
             &CliInteract,
         ),
     )
