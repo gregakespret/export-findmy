@@ -37,6 +37,7 @@ The tool will prompt for:
 |------|-------------|---------|
 | `--apple-id <email>` | Apple ID email | prompted if omitted |
 | `--anisette-url <url>` | Anisette v3 server URL | `https://ani.sidestore.io` |
+| `--anisette-headers-url <url>` | Server returning a real Mac's anisette headers as JSON on `GET`; replaces `--anisette-url`. Since 2026-10-13 Apple refuses (-80045) the Android anisette every v3 server runs. Use a Mac that is not in your own iCloud Keychain circle: its machine id becomes this run's keychain peer id | — |
 | `--output-dir <dir>` | Where to write plist files | `.` |
 | `--serve` | Run the localhost REST API instead of the CLI export (see below) | off |
 | `--port <n>` | Port for `--serve` (binds `127.0.0.1` only) | `5301` |
@@ -176,7 +177,9 @@ own.
 `signin_refused` (HTTP 502) is Apple turning the sign-in itself away with
 -80045 "This action cannot be completed at this time." It can arrive before
 Apple has checked the password, so it says nothing either way about the
-credentials, and only waiting gets past it.
+credentials. Since 2026-10-13 it is what Apple returns for the Android
+anisette every v3 server runs; a Mac's anisette, through
+`--anisette-headers-url`, gets past it.
 
 `trust_circle_signature` (HTTP 409) is deliberately separate from
 `bad_passcode`: it means the escrow bottle decrypted — so the device passcode

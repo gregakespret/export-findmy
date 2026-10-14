@@ -5,17 +5,18 @@ edition = "2021"
 description = "Export AirTag/FindMy accessory private keys from iCloud, producing plist files compatible with FindMy.py"
 
 [dependencies]
-rustpush = { git = "https://github.com/gregakespret/rustpush.git", branch = "findmy-export-support", default-features = false, features = ["remote-anisette-v3"] }
-omnisette = { git = "https://github.com/gregakespret/rustpush.git", branch = "findmy-export-support" }
-icloud_auth = { git = "https://github.com/gregakespret/rustpush.git", branch = "findmy-export-support", default-features = false, features = ["remote-anisette-v3"] }
-keystore = { git = "https://github.com/gregakespret/rustpush.git", branch = "findmy-export-support" }
-cloudkit-proto = { git = "https://github.com/gregakespret/rustpush.git", branch = "findmy-export-support" }
+rustpush = { git = "https://github.com/gregakespret/rustpush.git", branch = "fix/mac-escrow-identity", default-features = false, features = ["remote-anisette-v3"] }
+omnisette = { git = "https://github.com/gregakespret/rustpush.git", branch = "fix/mac-escrow-identity" }
+icloud_auth = { git = "https://github.com/gregakespret/rustpush.git", branch = "fix/mac-escrow-identity", default-features = false, features = ["remote-anisette-v3"] }
+keystore = { git = "https://github.com/gregakespret/rustpush.git", branch = "fix/mac-escrow-identity" }
+cloudkit-proto = { git = "https://github.com/gregakespret/rustpush.git", branch = "fix/mac-escrow-identity" }
 tokio = { version = "1", features = ["full"] }
 plist = "1.7.0"
 sha2 = "0.10.8"
 async-trait = "0.1.73"
 uuid = { version = "1.4.1", features = ["v4", "serde"] }
 rand = "0.8.5"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 libc = "0.2"
 log = "0.4"
 pretty_env_logger = "0.5.0"
