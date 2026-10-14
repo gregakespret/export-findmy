@@ -164,11 +164,16 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 (a wrong password *or* a wrong 2FA code — Apple judged what was typed and
 rejected it), `signin_refused`, `bad_passcode`, `trust_circle_signature`, `bad_device_index`,
 `no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
-`apple_error`.
+`sms_refused`, `anisette_unavailable`, `extractor_panic`, `apple_error`.
 
 A sign-in that fails *without* Apple ever judging the credentials — a non-2xx
-from a GSA endpoint, an anisette outage, an HTML error page where a plist was
-promised — is `apple_error` (HTTP 502), **not** `bad_credentials`. Clients
+from a GSA endpoint, an HTML error page where a plist was promised — is
+`apple_error` (HTTP 502), **not** `bad_credentials`. Three failures that used to
+share `apple_error` have their own code, also HTTP 502, because each needs
+different handling: `sms_refused` is Apple declining to text the 2FA code
+(HTTP 423, a send limit that only waiting lifts), `anisette_unavailable` is the
+anisette provisioning host failing, and `extractor_panic` is a bug in this
+tool. Clients
 must not treat every `POST /sessions` failure as a wrong password: the whole
 point of the split is that `detail` now tells the user whether retyping the
 password can possibly help, so surface `detail` rather than a message of your
