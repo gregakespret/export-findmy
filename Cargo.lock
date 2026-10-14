@@ -402,7 +402,7 @@ dependencies = [
 [[package]]
 name = "cloudkit-derive"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#bcc7da22c2a3462f5e649c7c79fd902508462b18"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=fix%2Fmac-escrow-identity#7363665ad1e2781af89f3599378c857be6c8fc24"
 dependencies = [
  "cloudkit-proto",
  "deluxe",
@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "cloudkit-proto"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#bcc7da22c2a3462f5e649c7c79fd902508462b18"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=fix%2Fmac-escrow-identity#7363665ad1e2781af89f3599378c857be6c8fc24"
 dependencies = [
  "base64 0.21.7",
  "disjoint_impls",
@@ -1419,7 +1419,7 @@ dependencies = [
 [[package]]
 name = "icloud_auth"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#bcc7da22c2a3462f5e649c7c79fd902508462b18"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=fix%2Fmac-escrow-identity#7363665ad1e2781af89f3599378c857be6c8fc24"
 dependencies = [
  "aes",
  "base64 0.13.1",
@@ -1682,7 +1682,7 @@ dependencies = [
 [[package]]
 name = "keystore"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#bcc7da22c2a3462f5e649c7c79fd902508462b18"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=fix%2Fmac-escrow-identity#7363665ad1e2781af89f3599378c857be6c8fc24"
 dependencies = [
  "aes-gcm",
  "openssl",
@@ -2025,7 +2025,7 @@ dependencies = [
 [[package]]
 name = "omnisette"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#bcc7da22c2a3462f5e649c7c79fd902508462b18"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=fix%2Fmac-escrow-identity#7363665ad1e2781af89f3599378c857be6c8fc24"
 dependencies = [
  "android-loader",
  "anyhow",
@@ -2746,7 +2746,7 @@ dependencies = [
 [[package]]
 name = "rustpush"
 version = "0.1.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#bcc7da22c2a3462f5e649c7c79fd902508462b18"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=fix%2Fmac-escrow-identity#7363665ad1e2781af89f3599378c857be6c8fc24"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3066,7 +3066,7 @@ dependencies = [
 [[package]]
 name = "srp"
 version = "0.6.0"
-source = "git+https://github.com/gregakespret/rustpush.git?branch=findmy-export-support#bcc7da22c2a3462f5e649c7c79fd902508462b18"
+source = "git+https://github.com/gregakespret/rustpush.git?branch=fix%2Fmac-escrow-identity#7363665ad1e2781af89f3599378c857be6c8fc24"
 dependencies = [
  "base64 0.21.7",
  "digest",
