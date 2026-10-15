@@ -505,8 +505,9 @@ pub async fn run_export(
                      started.elapsed().as_secs_f32(), e, e);
                 PipelineError::Apple(LOGIN_ANISETTE.to_string())
             })?;
-        // Device model and OS only: which identity Apple was shown.
-        log!("  Signing in as anisette machine {}", identity);
+        // Device model and OS only: which identity Apple was shown. Sanitized
+        // like any string we did not write: it comes off the network.
+        log!("  Signing in as anisette machine {}", sanitize(&identity));
         login_info = claim_anisette_machine(login_info, &identity);
     }
 
