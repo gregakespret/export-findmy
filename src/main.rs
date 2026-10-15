@@ -255,7 +255,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut apple_id = String::new();
-    let mut anisette = AnisetteServer::V3("https://ani.sidestore.io".to_string());
+    let mut anisette_url = None;
+    let mut anisette_headers_url = None;
     let mut output_dir = PathBuf::from(".");
     let mut debug = false;
     let mut serve = false;
@@ -274,14 +275,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--anisette-url" => {
                 i += 1;
                 match args.get(i) {
-                    Some(v) => anisette = AnisetteServer::V3(v.clone()),
+                    Some(v) => anisette_url = Some(v.clone()),
                     None => return arg_err("--anisette-url"),
                 }
             }
             "--anisette-headers-url" => {
                 i += 1;
                 match args.get(i) {
-                    Some(v) => anisette = AnisetteServer::Headers(v.clone()),
+                    Some(v) => anisette_headers_url = Some(v.clone()),
                     None => return arg_err("--anisette-headers-url"),
                 }
             }
@@ -316,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("  --anisette-url <url>     Anisette server URL (default: https://ani.sidestore.io)");
                 eprintln!("  --anisette-headers-url <url>");
                 eprintln!("                           Server returning a Mac's anisette headers as JSON on GET;");
-                eprintln!("                           replaces --anisette-url");
+                eprintln!("                           use instead of --anisette-url, not with it");
                 eprintln!("  --output-dir <dir>       Output directory for plist files (default: .)");
                 eprintln!("  --debug                  Print CloudKit record-type breakdown and per-record details");
                 eprintln!("  --serve                  Run the localhost REST API instead of the CLI export");
@@ -333,6 +334,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
+
+    // A start command that loses its anisette flag still boots and looks
+    // healthy, then fails every sign-in: a 2026-10-14 redeploy replayed one
+    // without --anisette-headers-url. Say so at boot rather than per connect.
+    if anisette_url.is_none() && anisette_headers_url.is_none() {
+        log::warn!(
+            "no --anisette-url or --anisette-headers-url given, so signing in through {} (v3), \
+             whose anisette Apple has refused with -80045 since 2026-10-13",
+            anisette::DEFAULT_V3_URL
+        );
+    }
+    let anisette = match AnisetteServer::from_flags(anisette_url, anisette_headers_url) {
+        Ok(anisette) => anisette,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
 
     if serve {
         return server::serve(port, anisette).await;
