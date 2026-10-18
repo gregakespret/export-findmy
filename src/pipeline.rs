@@ -184,16 +184,20 @@ const LOGIN_ANISETTE: &str =
 /// Every other variant gets a fixed sentence: rustpush's Display strings are
 /// written for its developers, and several (`CloudKitError`,
 /// `AuthenticationError`, …) are `{:?}` dumps too. A catch-all rather than a
-/// per-variant list, so a variant nobody has seen yet cannot leak either.
+/// per-variant list, so a variant nobody has seen yet cannot leak either. The
+/// sentence names no source: the catch-all also covers local failures (a
+/// network error, `PeerNoShares`), which Apple never returned.
 fn join_error_detail(e: &PushError) -> String {
     let PushError::EscrowError(reply) = e else {
-        return "Apple's keychain service returned an unexpected error".into();
+        return "an unexpected error occurred".into();
     };
     let field = |k: &str| reply.as_dictionary().and_then(|d| d.get(k));
-    let message = field("message").and_then(plist::Value::as_string);
+    // Apple's text goes on screen and into the CLI's terminal as-is, so a
+    // control character in it gets the same treatment as one in a device name.
+    let message = field("message").and_then(plist::Value::as_string).map(sanitize);
     // Seen as both a string ("-6015") and a number, depending on the endpoint.
     let status = field("status").and_then(|v| {
-        v.as_string().map(str::to_owned).or_else(|| v.as_signed_integer().map(|n| n.to_string()))
+        v.as_string().map(sanitize).or_else(|| v.as_signed_integer().map(|n| n.to_string()))
     });
     match (message, status) {
         (Some(m), Some(s)) => format!("Apple said \"{m}\" (status {s})"),
@@ -1049,10 +1053,17 @@ mod tests {
         let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
         assert_eq!(detail, "Apple's escrow service returned an error");
 
-        // Only the escrow reply is reshaped; every other error keeps its Display.
-        // Nor does any other variant's Display text, debug dumps included.
+        // Apple's text is printed to the CLI's terminal: an escape or newline in
+        // it must not reach the screen as one.
+        let mut d = plist::Dictionary::new();
+        d.insert("message".into(), "bad\n\u{1b}[2Jthing".into());
+        let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
+        assert!(!detail.contains('\n') && !detail.contains('\u{1b}'), "{detail:?}");
+
+        // No other variant's Display text reaches the user either, debug dumps
+        // included: every one gets the same fixed sentence.
         let cloudkit = PushError::CloudKitError(Default::default());
-        assert_eq!(join_error_detail(&cloudkit), "Apple's keychain service returned an unexpected error");
+        assert_eq!(join_error_detail(&cloudkit), "an unexpected error occurred");
         assert_eq!(join_error_detail(&PushError::PeerNoShares), join_error_detail(&cloudkit));
     }
 
