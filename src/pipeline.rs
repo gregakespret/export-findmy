@@ -176,6 +176,37 @@ const LOGIN_ANISETTE: &str =
      on did not respond. This is not a problem with your Apple ID or password, \
      and it is not Apple — it is on our side. Please try again later.";
 
+/// What the user sees of a failed join. An `EscrowError` displays as rustpush's
+/// debug dump of Apple's whole reply, `respBlob` included — an opaque base64
+/// blob that means nothing to the user. Only Apple's `message` and `status` go
+/// on screen; the full error is already in the log line above the call.
+///
+/// Every other variant gets a fixed sentence: rustpush's Display strings are
+/// written for its developers, and several (`CloudKitError`,
+/// `AuthenticationError`, …) are `{:?}` dumps too. A catch-all rather than a
+/// per-variant list, so a variant nobody has seen yet cannot leak either. The
+/// sentence names no source: the catch-all also covers local failures (a
+/// network error, `PeerNoShares`), which Apple never returned.
+fn join_error_detail(e: &PushError) -> String {
+    let PushError::EscrowError(reply) = e else {
+        return "an unexpected error occurred".into();
+    };
+    let field = |k: &str| reply.as_dictionary().and_then(|d| d.get(k));
+    // Apple's text goes on screen and into the CLI's terminal as-is, so a
+    // control character in it gets the same treatment as one in a device name.
+    let message = field("message").and_then(plist::Value::as_string).map(sanitize);
+    // Seen as both a string ("-6015") and a number, depending on the endpoint.
+    let status = field("status").and_then(|v| {
+        v.as_string().map(sanitize).or_else(|| v.as_signed_integer().map(|n| n.to_string()))
+    });
+    match (message, status) {
+        (Some(m), Some(s)) => format!("Apple said \"{m}\" (status {s})"),
+        (Some(m), None) => format!("Apple said \"{m}\""),
+        (None, Some(s)) => format!("Apple's escrow service returned status {s}"),
+        (None, None) => "Apple's escrow service returned an error".into(),
+    }
+}
+
 /// Which `PipelineError` a failed [`AppleAccount::login`] becomes.
 ///
 /// `icloud_auth::Error` mixes four unrelated failures behind one type, and
@@ -574,7 +605,9 @@ pub async fn run_export(
         // spilled to get it. See `logging::CHECKPOINTS`.
         if !matches!(e, PushError::BadMsg) {
             return Err(PipelineError::BadPasscode(format!(
-                "Joining the keychain trust circle failed (wrong passcode?): {e}"
+                "Joining the keychain trust circle failed: {}. \
+                 Check the passcode for this device, or try another device.",
+                join_error_detail(&e)
             )));
         }
         let failing = match logging::last_checkpoint() {
@@ -993,6 +1026,45 @@ mod tests {
         // was typed.
         let other = E::AuthSrpWithMessage(-20101, "Your Apple ID or password was incorrect.".into());
         assert_eq!(login_error(&other).code(), "bad_credentials");
+    }
+
+    #[test]
+    fn escrow_error_shows_apples_message_not_the_reply_blob() {
+        // The reply a user hit on 2026-10-18: the base64 respBlob was printed
+        // on the connect page verbatim.
+        let mut d = plist::Dictionary::new();
+        d.insert("version".into(), plist::Value::Integer(1.into()));
+        d.insert("status".into(), "-6015".into());
+        d.insert("respBlob".into(), "AAAAYAAAAKYAAAACN7W0".into());
+        d.insert("message".into(), "CLUBH ERROR: Credential is not verified.".into());
+        let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
+        assert_eq!(detail, "Apple said \"CLUBH ERROR: Credential is not verified.\" (status -6015)");
+
+        let mut d = plist::Dictionary::new();
+        d.insert("status".into(), plist::Value::Integer((-1).into()));
+        d.insert("dsid".into(), "1234567890".into());
+        let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
+        assert_eq!(detail, "Apple's escrow service returned status -1");
+        assert!(!detail.contains("1234567890"), "{detail}");
+
+        // A reply with neither field still says nothing of its contents.
+        let mut d = plist::Dictionary::new();
+        d.insert("respBlob".into(), "AAAAYAAAAKYAAAACN7W0".into());
+        let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
+        assert_eq!(detail, "Apple's escrow service returned an error");
+
+        // Apple's text is printed to the CLI's terminal: an escape or newline in
+        // it must not reach the screen as one.
+        let mut d = plist::Dictionary::new();
+        d.insert("message".into(), "bad\n\u{1b}[2Jthing".into());
+        let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
+        assert!(!detail.contains('\n') && !detail.contains('\u{1b}'), "{detail:?}");
+
+        // No other variant's Display text reaches the user either, debug dumps
+        // included: every one gets the same fixed sentence.
+        let cloudkit = PushError::CloudKitError(Default::default());
+        assert_eq!(join_error_detail(&cloudkit), "an unexpected error occurred");
+        assert_eq!(join_error_detail(&PushError::PeerNoShares), join_error_detail(&cloudkit));
     }
 
     #[test]
