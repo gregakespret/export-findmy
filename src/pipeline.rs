@@ -176,22 +176,6 @@ const LOGIN_ANISETTE: &str =
      on did not respond. This is not a problem with your Apple ID or password, \
      and it is not Apple — it is on our side. Please try again later.";
 
-/// Which `PipelineError` a failed [`AppleAccount::login`] becomes.
-///
-/// `icloud_auth::Error` mixes four unrelated failures behind one type, and
-/// mapping the lot to `bad_credentials` is what produced our commonest support
-/// case: "it says my password is wrong, but it isn't".
-///
-/// The discriminator is the *raise site*, not the variant name. `AuthSrp` reads
-/// like a rejected password and is not one: all five of its sites are
-/// `if !res.status().is_success()` against a GSA endpoint (three on
-/// `gsa.apple.com`, two on `gsas.apple.com`), i.e. a non-2xx — and only the one
-/// in `send_2fa_to_devices` is even reachable from `login`. A refused SMS send
-/// is `SmsSendFailed`, which carries Apple's reason. Apple rejects a password with a **200** carrying `ec != 0`, which
-/// arrives here as `AuthSrpWithMessage` — that is where -22406 "Enter the
-/// correct password for this Apple Account" comes from. `PlistError` is the
-/// same story one layer down: an HTML error page where a plist was promised.
-///
 /// What the user sees of a failed join. An `EscrowError` displays as rustpush's
 /// debug dump of Apple's whole reply, `respBlob` included — an opaque base64
 /// blob that means nothing to the user. Only Apple's `message` and `status` go
@@ -212,6 +196,22 @@ fn join_error_detail(e: &PushError) -> String {
     }
 }
 
+/// Which `PipelineError` a failed [`AppleAccount::login`] becomes.
+///
+/// `icloud_auth::Error` mixes four unrelated failures behind one type, and
+/// mapping the lot to `bad_credentials` is what produced our commonest support
+/// case: "it says my password is wrong, but it isn't".
+///
+/// The discriminator is the *raise site*, not the variant name. `AuthSrp` reads
+/// like a rejected password and is not one: all five of its sites are
+/// `if !res.status().is_success()` against a GSA endpoint (three on
+/// `gsa.apple.com`, two on `gsas.apple.com`), i.e. a non-2xx — and only the one
+/// in `send_2fa_to_devices` is even reachable from `login`. A refused SMS send
+/// is `SmsSendFailed`, which carries Apple's reason. Apple rejects a password with a **200** carrying `ec != 0`, which
+/// arrives here as `AuthSrpWithMessage` — that is where -22406 "Enter the
+/// correct password for this Apple Account" comes from. `PlistError` is the
+/// same story one layer down: an HTML error page where a plist was promised.
+///
 /// Matched exhaustively on purpose. `icloud_auth::Error` is not
 /// `#[non_exhaustive]`, so a `_` arm would let the next dependency bump add a
 /// credential verdict that silently lands in [`LOGIN_UPSTREAM`] — the same bug
@@ -594,7 +594,8 @@ pub async fn run_export(
         // spilled to get it. See `logging::CHECKPOINTS`.
         if !matches!(e, PushError::BadMsg) {
             return Err(PipelineError::BadPasscode(format!(
-                "Joining the keychain trust circle failed: {}",
+                "Joining the keychain trust circle failed: {}. \
+                 Check the passcode for this device, or try another device.",
                 join_error_detail(&e)
             )));
         }
@@ -1034,6 +1035,15 @@ mod tests {
         let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
         assert_eq!(detail, "Apple's escrow service returned status -1");
         assert!(!detail.contains("1234567890"), "{detail}");
+
+        // A reply with neither field still says nothing of its contents.
+        let mut d = plist::Dictionary::new();
+        d.insert("respBlob".into(), "AAAAYAAAAKYAAAACN7W0".into());
+        let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
+        assert_eq!(detail, "Apple's escrow service returned an error");
+
+        // Only the escrow reply is reshaped; every other error keeps its Display.
+        assert_eq!(join_error_detail(&PushError::PeerNoShares), PushError::PeerNoShares.to_string());
     }
 
     #[test]
