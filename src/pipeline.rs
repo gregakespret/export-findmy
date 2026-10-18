@@ -84,9 +84,8 @@ pub struct BeaconExport {
     pub pairing_date: Option<String>,
 }
 
-/// The code for [`PipelineError::TrustCircleSignature`]. Named separately
-/// because the retry path reports it before any error value exists — the join
-/// hasn't failed the *attempt*, it has failed this device.
+/// The code for [`PipelineError::TrustCircleSignature`]. Named so the server's
+/// retry test can drive the same code the pipeline reports.
 pub const TRUST_CIRCLE_SIGNATURE: &str = "trust_circle_signature";
 
 /// Failure at a specific pipeline stage, mapped to the API's error codes.
@@ -113,6 +112,10 @@ pub enum PipelineError {
     /// bottle, so "check your passcode" sends the user round a loop that cannot
     /// terminate. Trying a different trusted device is the way out.
     TrustCircleSignature(String),
+    /// The chosen device's peer holds no keychain key shares for us, so there
+    /// is nothing to join with. Reached after the passcode has worked, like
+    /// `TrustCircleSignature`; picking another trusted device gets past it.
+    DeviceNoShares(String),
     BadDeviceIndex(String),
     NoBottles,
     Apple(String),
@@ -127,6 +130,7 @@ impl PipelineError {
             PipelineError::SigninRefused(_) => "signin_refused",
             PipelineError::BadPasscode(_) => "bad_passcode",
             PipelineError::TrustCircleSignature(_) => TRUST_CIRCLE_SIGNATURE,
+            PipelineError::DeviceNoShares(_) => "device_no_shares",
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
             PipelineError::NoBottles => "no_bottles",
             PipelineError::Apple(_) => "apple_error",
@@ -144,6 +148,7 @@ impl std::fmt::Display for PipelineError {
             PipelineError::SigninRefused(m) => write!(f, "{m}"),
             PipelineError::BadPasscode(m) => write!(f, "{m}"),
             PipelineError::TrustCircleSignature(m) => write!(f, "{m}"),
+            PipelineError::DeviceNoShares(m) => write!(f, "{m}"),
             PipelineError::BadDeviceIndex(m) => write!(f, "{m}"),
             PipelineError::NoBottles => {
                 write!(f, "No escrow bottles found. Make sure you have another trusted device.")
@@ -186,24 +191,102 @@ const LOGIN_ANISETTE: &str =
 /// `AuthenticationError`, …) are `{:?}` dumps too. A catch-all rather than a
 /// per-variant list, so a variant nobody has seen yet cannot leak either. The
 /// sentence names no source: the catch-all also covers local failures (a
-/// network error, `PeerNoShares`), which Apple never returned.
+/// network error), which Apple never returned.
 fn join_error_detail(e: &PushError) -> String {
     let PushError::EscrowError(reply) = e else {
         return "an unexpected error occurred".into();
     };
-    let field = |k: &str| reply.as_dictionary().and_then(|d| d.get(k));
     // Apple's text goes on screen and into the CLI's terminal as-is, so a
     // control character in it gets the same treatment as one in a device name.
-    let message = field("message").and_then(plist::Value::as_string).map(sanitize);
-    // Seen as both a string ("-6015") and a number, depending on the endpoint.
-    let status = field("status").and_then(|v| {
-        v.as_string().map(sanitize).or_else(|| v.as_signed_integer().map(|n| n.to_string()))
-    });
-    match (message, status) {
+    let message = reply
+        .as_dictionary()
+        .and_then(|d| d.get("message"))
+        .and_then(plist::Value::as_string)
+        .map(sanitize);
+    match (message, escrow_status(reply)) {
         (Some(m), Some(s)) => format!("Apple said \"{m}\" (status {s})"),
         (Some(m), None) => format!("Apple said \"{m}\""),
         (None, Some(s)) => format!("Apple's escrow service returned status {s}"),
         (None, None) => "Apple's escrow service returned an error".into(),
+    }
+}
+
+/// The `status` of an escrow error reply. Seen as both a string ("-6015") and a
+/// number, depending on the endpoint.
+fn escrow_status(reply: &plist::Value) -> Option<String> {
+    let v = reply.as_dictionary()?.get("status")?;
+    v.as_string().map(sanitize).or_else(|| v.as_signed_integer().map(|n| n.to_string()))
+}
+
+/// Escrow `recover` refusing the SRP proof built from the passcode: HTTP 409,
+/// "CLUBH ERROR: Credential is not verified." Every -6015 in the production
+/// logs of 2026-10-11..18 came from `command=recover http=409`, and the users
+/// who hit it got through on a later try.
+const PASSCODE_NOT_VERIFIED: &str = "-6015";
+
+/// Which `PipelineError` a failed trust-circle join becomes, other than the
+/// `BadMsg` signature case the caller handles itself.
+///
+/// Only -6015 is Apple's verdict on the passcode, so only it is
+/// `bad_passcode`, which client alerting reads as user error. Everything else
+/// is `apple_error`: filed under the user, an escrow outage would fail every
+/// connect while reading green, as -80045 did for a day under
+/// `bad_credentials`.
+fn join_error(e: &PushError) -> PipelineError {
+    match e {
+        PushError::EscrowError(reply)
+            if escrow_status(reply).as_deref() == Some(PASSCODE_NOT_VERIFIED) =>
+        {
+            PipelineError::BadPasscode(format!(
+                "Joining the keychain trust circle failed: {}. \
+                 Check the passcode for this device, or try another device.",
+                join_error_detail(e)
+            ))
+        }
+        PushError::PeerNoShares => PipelineError::DeviceNoShares(
+            "The device you picked has no keychain keys to share, so the trust \
+             circle could not be joined through it. The passcode was accepted."
+                .into(),
+        ),
+        _ => PipelineError::Apple(format!(
+            "Joining the keychain trust circle failed: {}. \
+             Please try again in a few minutes, or try another device.",
+            join_error_detail(e)
+        )),
+    }
+}
+
+/// Whether a join failure belongs to the chosen device rather than the login,
+/// so the attempt asks for another device instead of ending. Both come after
+/// the passcode worked; `bad_passcode` and `apple_error` end the attempt.
+fn another_device_may_help(err: &PipelineError) -> bool {
+    matches!(err, PipelineError::TrustCircleSignature(_) | PipelineError::DeviceNoShares(_))
+}
+
+/// What a device-side join failure tells the user to do next, from what is
+/// left to try. "Try a different trusted device" on an account with only one
+/// sends the user looking for a device they do not have (user 139).
+fn next_step(devices: usize, untried: usize, attempts_left: bool) -> &'static str {
+    match (devices, untried, attempts_left) {
+        (..=1, _, _) => "It is the only trusted device on this Apple ID, so there is no \
+                         other to try. Signing in to this Apple ID on another iPhone, \
+                         iPad or Mac with a passcode set would give one.",
+        (_, 0, _) => "None of the trusted devices on this Apple ID could be used for \
+                      this step.",
+        (_, _, true) => "Pick a different trusted device.",
+        (_, _, false) => "Try connecting again with a trusted device you have not tried yet.",
+    }
+}
+
+/// `err` with `next` appended, for the two failures [`another_device_may_help`]
+/// accepts; any other error is returned as it is.
+fn with_next_step(err: PipelineError, next: &str) -> PipelineError {
+    match err {
+        PipelineError::TrustCircleSignature(m) => {
+            PipelineError::TrustCircleSignature(format!("{m} {next}"))
+        }
+        PipelineError::DeviceNoShares(m) => PipelineError::DeviceNoShares(format!("{m} {next}")),
+        other => other,
     }
 }
 
@@ -545,25 +628,32 @@ pub async fn run_export(
         // direction.
         log!("    [{}] {} ({}) [{}]", i, sanitize(&d.name), sanitize(&d.model), sanitize(&d.serial));
     }
-    // A signature failure is a property of the device the user picked, not of
-    // the login: the escrow bottle decrypted, so the passcode was right, and the
-    // circle's own signed data is what didn't verify. The way through is another
-    // device — so ask again rather than failing the attempt, which would cost
-    // the user their password and 2FA to retry the one thing the error tells
-    // them to do.
+    // A signature failure or a peer with no key shares is a property of the
+    // device the user picked, not of the login: the passcode was right, and
+    // what failed is that device's part of the circle. The way through is
+    // another device — so ask again rather than failing the attempt, which
+    // would cost the user their password and 2FA to retry the one thing the
+    // error tells them to do.
+    //
+    // Only devices not yet tried are offered: both failures are properties of
+    // the device, so the same one fails the same way and would spend an attempt.
+    // The index the driver returns is into what it was offered.
+    let mut untried: Vec<usize> = (0..bottles.len()).collect();
     for attempt in 1..=MAX_JOIN_ATTEMPTS {
-        let bottle_idx = io.choose_bottle(&devices).inspect_err(|e| {
+        let offered: Vec<DeviceInfo> = untried.iter().map(|&i| devices[i].clone()).collect();
+        let pick = io.choose_bottle(&offered).inspect_err(|e| {
             log!("!! FAILED at [5/7] device choice after {:.1}s: {} [{:?}]",
                  started.elapsed().as_secs_f32(), e, e);
         })?;
-        if bottle_idx >= bottles.len() {
+        if pick >= offered.len() {
             log!("!! FAILED at [5/7] device choice: index {} out of range 0-{}",
-                 bottle_idx, bottles.len().saturating_sub(1));
+                 pick, offered.len().saturating_sub(1));
             return Err(PipelineError::BadDeviceIndex(format!(
-                "Invalid device index {bottle_idx}. Must be 0-{}.",
-                bottles.len().saturating_sub(1)
+                "Invalid device index {pick}. Must be 0-{}.",
+                offered.len().saturating_sub(1)
             )));
         }
+        let bottle_idx = untried.remove(pick);
         let (bottle, _) = &bottles[bottle_idx];
         let passcode = io.get_passcode().inspect_err(|e| {
             log!("!! FAILED at [5/7] passcode input after {:.1}s: {} [{:?}]",
@@ -603,50 +693,49 @@ pub async fn run_export(
         // four sites, so which one it was comes from `logging`'s checkpoint —
         // available here at the default log level, with no keychain contents
         // spilled to get it. See `logging::CHECKPOINTS`.
-        if !matches!(e, PushError::BadMsg) {
-            return Err(PipelineError::BadPasscode(format!(
-                "Joining the keychain trust circle failed: {}. \
-                 Check the passcode for this device, or try another device.",
-                join_error_detail(&e)
-            )));
-        }
-        let failing = match logging::last_checkpoint() {
-            Some(c) => {
-                log!("   last keychain checkpoint: {:?}", c.prefix());
-                c.verifies()
+        let err = if matches!(e, PushError::BadMsg) {
+            let failing = match logging::last_checkpoint() {
+                Some(c) => {
+                    log!("   last keychain checkpoint: {:?}", c.prefix());
+                    c.verifies()
+                }
+                // Nothing reached: the first check in the join is the bottle's own
+                // escrowed-key signature, which rustpush verifies before the peer
+                // lookup that logs the first checkpoint.
+                None => Some("the escrow bottle's own escrowed-key signature"),
+            };
+            match failing {
+                Some(what) => log!("   => signature check failed on {what} — NOT a rejected \
+                                    passcode (the bottle had already decrypted)"),
+                // A checkpoint with no check after it. Saying which signature failed
+                // would be a guess, and the guess is the thing this whole path
+                // exists to stop.
+                None => log!("   => BadMsg at a point with no expected signature check; \
+                              not one of the known join sites"),
             }
-            // Nothing reached: the first check in the join is the bottle's own
-            // escrowed-key signature, which rustpush verifies before the peer
-            // lookup that logs the first checkpoint.
-            None => Some("the escrow bottle's own escrowed-key signature"),
+            PipelineError::TrustCircleSignature(format!(
+                "Joining the keychain trust circle failed a signature check on {}. \
+                 This is not a wrong passcode — the device passcode already worked.",
+                failing.unwrap_or("an unidentified signature")
+            ))
+        } else {
+            join_error(&e)
         };
-        match failing {
-            Some(what) => log!("   => signature check failed on {what} — NOT a rejected \
-                                passcode (the bottle had already decrypted)"),
-            // A checkpoint with no check after it. Saying which signature failed
-            // would be a guess, and the guess is the thing this whole path
-            // exists to stop.
-            None => log!("   => BadMsg at a point with no expected signature check; \
-                          not one of the known join sites"),
+        if !another_device_may_help(&err) {
+            return Err(err);
         }
-        let detail = format!(
-            "Joining the keychain trust circle failed a signature check on {}. \
-             This is not a wrong passcode — the device passcode already worked. \
-             Try connecting with a different trusted device.",
-            failing.unwrap_or("an unidentified signature")
-        );
-        // Retrying needs somewhere to go. With one device the user would just be
-        // asked for the same one again — and the CLI, which auto-picks when
-        // there is only one, would silently re-run it to the attempt limit.
-        if attempt == MAX_JOIN_ATTEMPTS || devices.len() < 2 {
+        // Retrying needs somewhere to go: an untried device, and an attempt left.
+        let attempts_left = attempt < MAX_JOIN_ATTEMPTS;
+        let err = with_next_step(err, next_step(devices.len(), untried.len(), attempts_left));
+        if untried.is_empty() || !attempts_left {
             log!("   => no retry ({}); ending the attempt",
-                 if devices.len() < 2 { "only one trusted device" } else { "attempts spent" });
-            return Err(PipelineError::TrustCircleSignature(detail));
+                 if untried.is_empty() { "no untried device" } else { "attempts spent" });
+            return Err(err);
         }
         // Round again: `join_retryable` lets the driver report this, and the
         // next `choose_bottle` collects another device.
         log!("   => asking for another device (attempt {}/{})", attempt + 1, MAX_JOIN_ATTEMPTS);
-        io.join_retryable(TRUST_CIRCLE_SIGNATURE, &detail);
+        io.join_retryable(err.code(), &err.to_string());
     }
 
     // ── Step 6: Fetch BeaconStore records from CloudKit ─────────────
@@ -1065,6 +1154,53 @@ mod tests {
         let cloudkit = PushError::CloudKitError(Default::default());
         assert_eq!(join_error_detail(&cloudkit), "an unexpected error occurred");
         assert_eq!(join_error_detail(&PushError::PeerNoShares), join_error_detail(&cloudkit));
+    }
+
+    fn escrow_reply(status: plist::Value) -> PushError {
+        let mut d = plist::Dictionary::new();
+        d.insert("status".into(), status);
+        d.insert("message".into(), "CLUBH ERROR: Credential is not verified.".into());
+        PushError::EscrowError(plist::Value::Dictionary(d))
+    }
+
+    #[test]
+    fn only_apples_passcode_verdict_is_bad_passcode() {
+        // -6015 is Apple refusing the SRP proof built from the passcode, in
+        // either encoding: the user can fix it.
+        for status in ["-6015".into(), plist::Value::Integer((-6015).into())] {
+            assert_eq!(join_error(&escrow_reply(status)).code(), "bad_passcode");
+        }
+        // Any other escrow refusal is Apple's side. Filed under the user, an
+        // escrow outage would fail every connect without alerting.
+        assert_eq!(join_error(&escrow_reply("-6001".into())).code(), "apple_error");
+        assert_eq!(join_error(&PushError::CloudKitError(Default::default())).code(), "apple_error");
+        // A device with no key shares: the passcode worked, another device is
+        // the way through, so it must not tell the user to re-check it.
+        let no_shares = join_error(&PushError::PeerNoShares);
+        assert_eq!(no_shares.code(), "device_no_shares");
+        assert!(no_shares.to_string().contains("passcode was accepted"), "{no_shares}");
+        // And it keeps the session for that other device: ending the attempt
+        // would cost the user their password and 2FA just to pick again.
+        assert!(another_device_may_help(&no_shares));
+        assert!(another_device_may_help(&PipelineError::TrustCircleSignature("x".into())));
+        assert!(!another_device_may_help(&join_error(&escrow_reply("-6015".into()))));
+        assert!(!another_device_may_help(&join_error(&escrow_reply("-6001".into()))));
+    }
+
+    #[test]
+    fn the_next_step_never_names_a_device_the_user_does_not_have() {
+        // One device on the account: "a different trusted device" is a dead end
+        // (user 139), so it says how to get one instead.
+        assert!(next_step(1, 0, true).contains("only trusted device"));
+        // Every device tried: nothing left to pick.
+        assert!(!next_step(3, 0, true).contains("different"));
+        assert!(next_step(3, 1, true).contains("different trusted device"));
+        assert!(next_step(3, 1, false).contains("not tried yet"));
+        // Appended only to the device-side failures.
+        let e = with_next_step(PipelineError::DeviceNoShares("No shares.".into()), "Next.");
+        assert_eq!(e.to_string(), "No shares. Next.");
+        let e = with_next_step(PipelineError::Apple("Down.".into()), "Next.");
+        assert_eq!(e.to_string(), "Down.");
     }
 
     #[test]
