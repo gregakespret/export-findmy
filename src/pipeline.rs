@@ -84,9 +84,8 @@ pub struct BeaconExport {
     pub pairing_date: Option<String>,
 }
 
-/// The code for [`PipelineError::TrustCircleSignature`]. Named separately
-/// because the retry path reports it before any error value exists — the join
-/// hasn't failed the *attempt*, it has failed this device.
+/// The code for [`PipelineError::TrustCircleSignature`]. Named so the server's
+/// retry test can drive the same code the pipeline reports.
 pub const TRUST_CIRCLE_SIGNATURE: &str = "trust_circle_signature";
 
 /// Failure at a specific pipeline stage, mapped to the API's error codes.
@@ -234,14 +233,14 @@ const PASSCODE_NOT_VERIFIED: &str = "-6015";
 /// connect while reading green, as -80045 did for a day under
 /// `bad_credentials`.
 fn join_error(e: &PushError) -> PipelineError {
-    let detail = join_error_detail(e);
     match e {
         PushError::EscrowError(reply)
             if escrow_status(reply).as_deref() == Some(PASSCODE_NOT_VERIFIED) =>
         {
             PipelineError::BadPasscode(format!(
-                "Joining the keychain trust circle failed: {detail}. \
-                 Check the passcode for this device, or try another device."
+                "Joining the keychain trust circle failed: {}. \
+                 Check the passcode for this device, or try another device.",
+                join_error_detail(e)
             ))
         }
         PushError::PeerNoShares => PipelineError::DeviceNoShares(
@@ -251,8 +250,9 @@ fn join_error(e: &PushError) -> PipelineError {
                 .into(),
         ),
         _ => PipelineError::Apple(format!(
-            "Joining the keychain trust circle failed: {detail}. \
-             Please try again in a few minutes, or try another device."
+            "Joining the keychain trust circle failed: {}. \
+             Please try again in a few minutes, or try another device.",
+            join_error_detail(e)
         )),
     }
 }
