@@ -594,7 +594,7 @@ pub async fn run_export(
         // spilled to get it. See `logging::CHECKPOINTS`.
         if !matches!(e, PushError::BadMsg) {
             return Err(PipelineError::BadPasscode(format!(
-                "Joining the keychain trust circle failed (wrong passcode?): {}",
+                "Joining the keychain trust circle failed: {}",
                 join_error_detail(&e)
             )));
         }

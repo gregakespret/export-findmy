@@ -109,8 +109,8 @@ error in both its `Display` and `Debug` forms. The Debug form is the useful one:
 rustpush collapses unrelated failures onto the same words, and only the variant
 name tells them apart. In particular **`Bad message` / `BadMsg` is a signature
 check inside escrow recovery, not a rejected passcode** — it is reached after
-the passcode has already opened the bottle, so the "(wrong passcode?)" wording
-in the user-facing message is misleading for that one. A genuinely wrong
+the passcode has already opened the bottle, so it gets its own user-facing
+message (`trust_circle_signature`). A genuinely wrong
 passcode fails earlier, in the SRP exchange, as an escrow/HTTP error.
 
 Passwords, passcodes and 2FA codes are never logged — only their lengths, which
