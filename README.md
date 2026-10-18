@@ -181,19 +181,18 @@ credentials. Since 2026-10-13 it is what Apple returns for the Android
 anisette every v3 server runs; a Mac's anisette, through
 `--anisette-headers-url`, gets past it.
 
-`trust_circle_signature` (HTTP 409) is deliberately separate from
-`bad_passcode`: it means the escrow bottle decrypted — so the device passcode
-was correct — and the join then failed verifying one of the trust circle's
-signatures. Prompting for the passcode again cannot resolve it; the user should
-try a different trusted device. The server log names which signature failed.
-
 `bad_passcode` (HTTP 400) is only Apple's escrow refusing the passcode itself
-(status -6015, "Credential is not verified."). `device_no_shares` (HTTP 409)
-means the passcode worked but the chosen device has no keychain key shares to
-join with; another trusted device gets past it. Any other join failure is
+(status -6015, "Credential is not verified."). Two join failures come after
+the passcode worked and get HTTP 409 instead; any other join failure is
 `apple_error`.
 
-**It is also the one error that does not end the attempt.** When another device
+`trust_circle_signature` means the escrow bottle decrypted and the join then
+failed verifying one of the trust circle's signatures. The server log names
+which signature failed. `device_no_shares` means the chosen device has no
+keychain key shares to join with. Prompting for the passcode again resolves
+neither; the user should try a different trusted device.
+
+**Neither ends the attempt.** When another device
 is available, `POST /escrow` answers with the session still live and the body
 carries `"retryable": true`, `"state": "awaiting_passcode"` and the `devices`
 list again — the login and 2FA are still held, so the client should re-render
