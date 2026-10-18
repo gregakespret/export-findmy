@@ -179,9 +179,16 @@ const LOGIN_ANISETTE: &str =
 /// What the user sees of a failed join. An `EscrowError` displays as rustpush's
 /// debug dump of Apple's whole reply, `respBlob` included — an opaque base64
 /// blob that means nothing to the user. Only Apple's `message` and `status` go
-/// on screen; the full reply is already in the log line above the call.
+/// on screen; the full error is already in the log line above the call.
+///
+/// Every other variant gets a fixed sentence: rustpush's Display strings are
+/// written for its developers, and several (`CloudKitError`,
+/// `AuthenticationError`, …) are `{:?}` dumps too. A catch-all rather than a
+/// per-variant list, so a variant nobody has seen yet cannot leak either.
 fn join_error_detail(e: &PushError) -> String {
-    let PushError::EscrowError(reply) = e else { return e.to_string() };
+    let PushError::EscrowError(reply) = e else {
+        return "Apple's keychain service returned an unexpected error".into();
+    };
     let field = |k: &str| reply.as_dictionary().and_then(|d| d.get(k));
     let message = field("message").and_then(plist::Value::as_string);
     // Seen as both a string ("-6015") and a number, depending on the endpoint.
@@ -1043,7 +1050,10 @@ mod tests {
         assert_eq!(detail, "Apple's escrow service returned an error");
 
         // Only the escrow reply is reshaped; every other error keeps its Display.
-        assert_eq!(join_error_detail(&PushError::PeerNoShares), PushError::PeerNoShares.to_string());
+        // Nor does any other variant's Display text, debug dumps included.
+        let cloudkit = PushError::CloudKitError(Default::default());
+        assert_eq!(join_error_detail(&cloudkit), "Apple's keychain service returned an unexpected error");
+        assert_eq!(join_error_detail(&PushError::PeerNoShares), join_error_detail(&cloudkit));
     }
 
     #[test]
