@@ -192,6 +192,26 @@ const LOGIN_ANISETTE: &str =
 /// correct password for this Apple Account" comes from. `PlistError` is the
 /// same story one layer down: an HTML error page where a plist was promised.
 ///
+/// What the user sees of a failed join. An `EscrowError` displays as rustpush's
+/// debug dump of Apple's whole reply, `respBlob` included — an opaque base64
+/// blob that means nothing to the user. Only Apple's `message` and `status` go
+/// on screen; the full reply is already in the log line above the call.
+fn join_error_detail(e: &PushError) -> String {
+    let PushError::EscrowError(reply) = e else { return e.to_string() };
+    let field = |k: &str| reply.as_dictionary().and_then(|d| d.get(k));
+    let message = field("message").and_then(plist::Value::as_string);
+    // Seen as both a string ("-6015") and a number, depending on the endpoint.
+    let status = field("status").and_then(|v| {
+        v.as_string().map(str::to_owned).or_else(|| v.as_signed_integer().map(|n| n.to_string()))
+    });
+    match (message, status) {
+        (Some(m), Some(s)) => format!("Apple said \"{m}\" (status {s})"),
+        (Some(m), None) => format!("Apple said \"{m}\""),
+        (None, Some(s)) => format!("Apple's escrow service returned status {s}"),
+        (None, None) => "Apple's escrow service returned an error".into(),
+    }
+}
+
 /// Matched exhaustively on purpose. `icloud_auth::Error` is not
 /// `#[non_exhaustive]`, so a `_` arm would let the next dependency bump add a
 /// credential verdict that silently lands in [`LOGIN_UPSTREAM`] — the same bug
@@ -574,7 +594,8 @@ pub async fn run_export(
         // spilled to get it. See `logging::CHECKPOINTS`.
         if !matches!(e, PushError::BadMsg) {
             return Err(PipelineError::BadPasscode(format!(
-                "Joining the keychain trust circle failed (wrong passcode?): {e}"
+                "Joining the keychain trust circle failed (wrong passcode?): {}",
+                join_error_detail(&e)
             )));
         }
         let failing = match logging::last_checkpoint() {
@@ -993,6 +1014,26 @@ mod tests {
         // was typed.
         let other = E::AuthSrpWithMessage(-20101, "Your Apple ID or password was incorrect.".into());
         assert_eq!(login_error(&other).code(), "bad_credentials");
+    }
+
+    #[test]
+    fn escrow_error_shows_apples_message_not_the_reply_blob() {
+        // The reply a user hit on 2026-10-18: the base64 respBlob was printed
+        // on the connect page verbatim.
+        let mut d = plist::Dictionary::new();
+        d.insert("version".into(), plist::Value::Integer(1.into()));
+        d.insert("status".into(), "-6015".into());
+        d.insert("respBlob".into(), "AAAAYAAAAKYAAAACN7W0".into());
+        d.insert("message".into(), "CLUBH ERROR: Credential is not verified.".into());
+        let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
+        assert_eq!(detail, "Apple said \"CLUBH ERROR: Credential is not verified.\" (status -6015)");
+
+        let mut d = plist::Dictionary::new();
+        d.insert("status".into(), plist::Value::Integer((-1).into()));
+        d.insert("dsid".into(), "1234567890".into());
+        let detail = join_error_detail(&PushError::EscrowError(plist::Value::Dictionary(d)));
+        assert_eq!(detail, "Apple's escrow service returned status -1");
+        assert!(!detail.contains("1234567890"), "{detail}");
     }
 
     #[test]
