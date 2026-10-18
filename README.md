@@ -162,7 +162,7 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (a wrong password *or* a wrong 2FA code — Apple judged what was typed and
-rejected it), `signin_refused`, `bad_passcode`, `trust_circle_signature`, `bad_device_index`,
+rejected it), `signin_refused`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
 `no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
 `apple_error`.
 
@@ -186,6 +186,12 @@ anisette every v3 server runs; a Mac's anisette, through
 was correct — and the join then failed verifying one of the trust circle's
 signatures. Prompting for the passcode again cannot resolve it; the user should
 try a different trusted device. The server log names which signature failed.
+
+`bad_passcode` (HTTP 400) is only Apple's escrow refusing the passcode itself
+(status -6015, "Credential is not verified."). `device_no_shares` (HTTP 409)
+means the passcode worked but the chosen device has no keychain key shares to
+join with; another trusted device gets past it. Any other join failure is
+`apple_error`.
 
 **It is also the one error that does not end the attempt.** When another device
 is available, `POST /escrow` answers with the session still live and the body

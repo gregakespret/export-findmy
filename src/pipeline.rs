@@ -113,6 +113,10 @@ pub enum PipelineError {
     /// bottle, so "check your passcode" sends the user round a loop that cannot
     /// terminate. Trying a different trusted device is the way out.
     TrustCircleSignature(String),
+    /// The chosen device's peer holds no keychain key shares for us, so there
+    /// is nothing to join with. Reached after the passcode has worked, like
+    /// `TrustCircleSignature`; picking another trusted device gets past it.
+    DeviceNoShares(String),
     BadDeviceIndex(String),
     NoBottles,
     Apple(String),
@@ -127,6 +131,7 @@ impl PipelineError {
             PipelineError::SigninRefused(_) => "signin_refused",
             PipelineError::BadPasscode(_) => "bad_passcode",
             PipelineError::TrustCircleSignature(_) => TRUST_CIRCLE_SIGNATURE,
+            PipelineError::DeviceNoShares(_) => "device_no_shares",
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
             PipelineError::NoBottles => "no_bottles",
             PipelineError::Apple(_) => "apple_error",
@@ -144,6 +149,7 @@ impl std::fmt::Display for PipelineError {
             PipelineError::SigninRefused(m) => write!(f, "{m}"),
             PipelineError::BadPasscode(m) => write!(f, "{m}"),
             PipelineError::TrustCircleSignature(m) => write!(f, "{m}"),
+            PipelineError::DeviceNoShares(m) => write!(f, "{m}"),
             PipelineError::BadDeviceIndex(m) => write!(f, "{m}"),
             PipelineError::NoBottles => {
                 write!(f, "No escrow bottles found. Make sure you have another trusted device.")
@@ -186,24 +192,68 @@ const LOGIN_ANISETTE: &str =
 /// `AuthenticationError`, …) are `{:?}` dumps too. A catch-all rather than a
 /// per-variant list, so a variant nobody has seen yet cannot leak either. The
 /// sentence names no source: the catch-all also covers local failures (a
-/// network error, `PeerNoShares`), which Apple never returned.
+/// network error), which Apple never returned.
 fn join_error_detail(e: &PushError) -> String {
     let PushError::EscrowError(reply) = e else {
         return "an unexpected error occurred".into();
     };
-    let field = |k: &str| reply.as_dictionary().and_then(|d| d.get(k));
     // Apple's text goes on screen and into the CLI's terminal as-is, so a
     // control character in it gets the same treatment as one in a device name.
-    let message = field("message").and_then(plist::Value::as_string).map(sanitize);
-    // Seen as both a string ("-6015") and a number, depending on the endpoint.
-    let status = field("status").and_then(|v| {
-        v.as_string().map(sanitize).or_else(|| v.as_signed_integer().map(|n| n.to_string()))
-    });
-    match (message, status) {
+    let message = reply
+        .as_dictionary()
+        .and_then(|d| d.get("message"))
+        .and_then(plist::Value::as_string)
+        .map(sanitize);
+    match (message, escrow_status(reply)) {
         (Some(m), Some(s)) => format!("Apple said \"{m}\" (status {s})"),
         (Some(m), None) => format!("Apple said \"{m}\""),
         (None, Some(s)) => format!("Apple's escrow service returned status {s}"),
         (None, None) => "Apple's escrow service returned an error".into(),
+    }
+}
+
+/// The `status` of an escrow error reply. Seen as both a string ("-6015") and a
+/// number, depending on the endpoint.
+fn escrow_status(reply: &plist::Value) -> Option<String> {
+    let v = reply.as_dictionary()?.get("status")?;
+    v.as_string().map(sanitize).or_else(|| v.as_signed_integer().map(|n| n.to_string()))
+}
+
+/// Escrow `recover` refusing the SRP proof built from the passcode: HTTP 409,
+/// "CLUBH ERROR: Credential is not verified." Every -6015 in the production
+/// logs of 2026-10-11..18 came from `command=recover http=409`, and the users
+/// who hit it got through on a later try.
+const PASSCODE_NOT_VERIFIED: &str = "-6015";
+
+/// Which `PipelineError` a failed trust-circle join becomes, other than the
+/// `BadMsg` signature case the caller handles itself.
+///
+/// Only -6015 is Apple's verdict on the passcode, so only it is
+/// `bad_passcode`, which client alerting reads as user error. Everything else
+/// is `apple_error`: filed under the user, an escrow outage would fail every
+/// connect while reading green, as -80045 did for a day under
+/// `bad_credentials`.
+fn join_error(e: &PushError) -> PipelineError {
+    let detail = join_error_detail(e);
+    match e {
+        PushError::EscrowError(reply)
+            if escrow_status(reply).as_deref() == Some(PASSCODE_NOT_VERIFIED) =>
+        {
+            PipelineError::BadPasscode(format!(
+                "Joining the keychain trust circle failed: {detail}. \
+                 Check the passcode for this device, or try another device."
+            ))
+        }
+        PushError::PeerNoShares => PipelineError::DeviceNoShares(
+            "The device you picked has no keychain keys to share, so the trust \
+             circle could not be joined through it. The passcode was accepted. \
+             Try connecting with a different trusted device."
+                .into(),
+        ),
+        _ => PipelineError::Apple(format!(
+            "Joining the keychain trust circle failed: {detail}. \
+             Please try again in a few minutes, or try another device."
+        )),
     }
 }
 
@@ -604,11 +654,7 @@ pub async fn run_export(
         // available here at the default log level, with no keychain contents
         // spilled to get it. See `logging::CHECKPOINTS`.
         if !matches!(e, PushError::BadMsg) {
-            return Err(PipelineError::BadPasscode(format!(
-                "Joining the keychain trust circle failed: {}. \
-                 Check the passcode for this device, or try another device.",
-                join_error_detail(&e)
-            )));
+            return Err(join_error(&e));
         }
         let failing = match logging::last_checkpoint() {
             Some(c) => {
@@ -1065,6 +1111,31 @@ mod tests {
         let cloudkit = PushError::CloudKitError(Default::default());
         assert_eq!(join_error_detail(&cloudkit), "an unexpected error occurred");
         assert_eq!(join_error_detail(&PushError::PeerNoShares), join_error_detail(&cloudkit));
+    }
+
+    fn escrow_reply(status: plist::Value) -> PushError {
+        let mut d = plist::Dictionary::new();
+        d.insert("status".into(), status);
+        d.insert("message".into(), "CLUBH ERROR: Credential is not verified.".into());
+        PushError::EscrowError(plist::Value::Dictionary(d))
+    }
+
+    #[test]
+    fn only_apples_passcode_verdict_is_bad_passcode() {
+        // -6015 is Apple refusing the SRP proof built from the passcode, in
+        // either encoding: the user can fix it.
+        for status in ["-6015".into(), plist::Value::Integer((-6015).into())] {
+            assert_eq!(join_error(&escrow_reply(status)).code(), "bad_passcode");
+        }
+        // Any other escrow refusal is Apple's side. Filed under the user, an
+        // escrow outage would fail every connect without alerting.
+        assert_eq!(join_error(&escrow_reply("-6001".into())).code(), "apple_error");
+        assert_eq!(join_error(&PushError::CloudKitError(Default::default())).code(), "apple_error");
+        // A device with no key shares: the passcode worked, another device is
+        // the way through, so it must not tell the user to re-check it.
+        let no_shares = join_error(&PushError::PeerNoShares);
+        assert_eq!(no_shares.code(), "device_no_shares");
+        assert!(no_shares.to_string().contains("different trusted device"), "{no_shares}");
     }
 
     #[test]

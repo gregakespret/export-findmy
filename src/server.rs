@@ -643,7 +643,7 @@ fn status_for(code: &str) -> StatusCode {
         // Not a malformed request: the passcode was right and the input was
         // valid. What conflicts is the state of the account's keychain trust
         // circle, which no correction to this request can fix.
-        "trust_circle_signature" => StatusCode::CONFLICT,
+        "trust_circle_signature" | "device_no_shares" => StatusCode::CONFLICT,
         "session_not_found" => StatusCode::NOT_FOUND,
         "session_expired" => StatusCode::GONE,
         _ => StatusCode::BAD_GATEWAY,
