@@ -182,7 +182,6 @@ impl Interact for CliInteract {
         // the user would assume they had mistyped the passcode — the one thing
         // this error means they did not do.
         eprintln!("  {detail}");
-        eprintln!("  Pick a different device and try again.");
     }
 }
 

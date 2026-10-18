@@ -245,8 +245,7 @@ fn join_error(e: &PushError) -> PipelineError {
         }
         PushError::PeerNoShares => PipelineError::DeviceNoShares(
             "The device you picked has no keychain keys to share, so the trust \
-             circle could not be joined through it. The passcode was accepted. \
-             Try connecting with a different trusted device."
+             circle could not be joined through it. The passcode was accepted."
                 .into(),
         ),
         _ => PipelineError::Apple(format!(
@@ -262,6 +261,33 @@ fn join_error(e: &PushError) -> PipelineError {
 /// the passcode worked; `bad_passcode` and `apple_error` end the attempt.
 fn another_device_may_help(err: &PipelineError) -> bool {
     matches!(err, PipelineError::TrustCircleSignature(_) | PipelineError::DeviceNoShares(_))
+}
+
+/// What a device-side join failure tells the user to do next, from what is
+/// left to try. "Try a different trusted device" on an account with only one
+/// sends the user looking for a device they do not have (user 139).
+fn next_step(devices: usize, untried: usize, attempts_left: bool) -> &'static str {
+    match (devices, untried, attempts_left) {
+        (..=1, _, _) => "It is the only trusted device on this Apple ID, so there is no \
+                         other to try. Signing in to this Apple ID on another iPhone, \
+                         iPad or Mac with a passcode set would give one.",
+        (_, 0, _) => "None of the trusted devices on this Apple ID could be used for \
+                      this step.",
+        (_, _, true) => "Pick a different trusted device.",
+        (_, _, false) => "Try connecting again with a trusted device you have not tried yet.",
+    }
+}
+
+/// `err` with `next` appended, for the two failures [`another_device_may_help`]
+/// accepts; any other error is returned as it is.
+fn with_next_step(err: PipelineError, next: &str) -> PipelineError {
+    match err {
+        PipelineError::TrustCircleSignature(m) => {
+            PipelineError::TrustCircleSignature(format!("{m} {next}"))
+        }
+        PipelineError::DeviceNoShares(m) => PipelineError::DeviceNoShares(format!("{m} {next}")),
+        other => other,
+    }
 }
 
 /// Which `PipelineError` a failed [`AppleAccount::login`] becomes.
@@ -608,19 +634,26 @@ pub async fn run_export(
     // another device — so ask again rather than failing the attempt, which
     // would cost the user their password and 2FA to retry the one thing the
     // error tells them to do.
+    //
+    // Only devices not yet tried are offered: both failures are properties of
+    // the device, so the same one fails the same way and would spend an attempt.
+    // The index the driver returns is into what it was offered.
+    let mut untried: Vec<usize> = (0..bottles.len()).collect();
     for attempt in 1..=MAX_JOIN_ATTEMPTS {
-        let bottle_idx = io.choose_bottle(&devices).inspect_err(|e| {
+        let offered: Vec<DeviceInfo> = untried.iter().map(|&i| devices[i].clone()).collect();
+        let pick = io.choose_bottle(&offered).inspect_err(|e| {
             log!("!! FAILED at [5/7] device choice after {:.1}s: {} [{:?}]",
                  started.elapsed().as_secs_f32(), e, e);
         })?;
-        if bottle_idx >= bottles.len() {
+        if pick >= offered.len() {
             log!("!! FAILED at [5/7] device choice: index {} out of range 0-{}",
-                 bottle_idx, bottles.len().saturating_sub(1));
+                 pick, offered.len().saturating_sub(1));
             return Err(PipelineError::BadDeviceIndex(format!(
-                "Invalid device index {bottle_idx}. Must be 0-{}.",
-                bottles.len().saturating_sub(1)
+                "Invalid device index {pick}. Must be 0-{}.",
+                offered.len().saturating_sub(1)
             )));
         }
+        let bottle_idx = untried.remove(pick);
         let (bottle, _) = &bottles[bottle_idx];
         let passcode = io.get_passcode().inspect_err(|e| {
             log!("!! FAILED at [5/7] passcode input after {:.1}s: {} [{:?}]",
@@ -682,8 +715,7 @@ pub async fn run_export(
             }
             PipelineError::TrustCircleSignature(format!(
                 "Joining the keychain trust circle failed a signature check on {}. \
-                 This is not a wrong passcode — the device passcode already worked. \
-                 Try connecting with a different trusted device.",
+                 This is not a wrong passcode — the device passcode already worked.",
                 failing.unwrap_or("an unidentified signature")
             ))
         } else {
@@ -692,12 +724,12 @@ pub async fn run_export(
         if !another_device_may_help(&err) {
             return Err(err);
         }
-        // Retrying needs somewhere to go. With one device the user would just be
-        // asked for the same one again — and the CLI, which auto-picks when
-        // there is only one, would silently re-run it to the attempt limit.
-        if attempt == MAX_JOIN_ATTEMPTS || devices.len() < 2 {
+        // Retrying needs somewhere to go: an untried device, and an attempt left.
+        let attempts_left = attempt < MAX_JOIN_ATTEMPTS;
+        let err = with_next_step(err, next_step(devices.len(), untried.len(), attempts_left));
+        if untried.is_empty() || !attempts_left {
             log!("   => no retry ({}); ending the attempt",
-                 if devices.len() < 2 { "only one trusted device" } else { "attempts spent" });
+                 if untried.is_empty() { "no untried device" } else { "attempts spent" });
             return Err(err);
         }
         // Round again: `join_retryable` lets the driver report this, and the
@@ -1146,13 +1178,29 @@ mod tests {
         // the way through, so it must not tell the user to re-check it.
         let no_shares = join_error(&PushError::PeerNoShares);
         assert_eq!(no_shares.code(), "device_no_shares");
-        assert!(no_shares.to_string().contains("different trusted device"), "{no_shares}");
+        assert!(no_shares.to_string().contains("passcode was accepted"), "{no_shares}");
         // And it keeps the session for that other device: ending the attempt
         // would cost the user their password and 2FA just to pick again.
         assert!(another_device_may_help(&no_shares));
         assert!(another_device_may_help(&PipelineError::TrustCircleSignature("x".into())));
         assert!(!another_device_may_help(&join_error(&escrow_reply("-6015".into()))));
         assert!(!another_device_may_help(&join_error(&escrow_reply("-6001".into()))));
+    }
+
+    #[test]
+    fn the_next_step_never_names_a_device_the_user_does_not_have() {
+        // One device on the account: "a different trusted device" is a dead end
+        // (user 139), so it says how to get one instead.
+        assert!(next_step(1, 0, true).contains("only trusted device"));
+        // Every device tried: nothing left to pick.
+        assert!(!next_step(3, 0, true).contains("different"));
+        assert!(next_step(3, 1, true).contains("different trusted device"));
+        assert!(next_step(3, 1, false).contains("not tried yet"));
+        // Appended only to the device-side failures.
+        let e = with_next_step(PipelineError::DeviceNoShares("No shares.".into()), "Next.");
+        assert_eq!(e.to_string(), "No shares. Next.");
+        let e = with_next_step(PipelineError::Apple("Down.".into()), "Next.");
+        assert_eq!(e.to_string(), "Down.");
     }
 
     #[test]
