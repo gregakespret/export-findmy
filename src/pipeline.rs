@@ -105,6 +105,12 @@ pub enum PipelineError {
     /// is a 401 that client alerting reads as user error, so a refusal of
     /// every sign-in read green for a day.
     SigninRefused(String),
+    /// Apple's -20209 "This Apple Account has been locked for security
+    /// reasons": often its answer to a run of wrong passwords, but once it
+    /// comes back no password works until the owner unlocks the account at
+    /// iforgot.apple.com. Kept apart from `BadCredentials` because that 401
+    /// tells the user to retype, and every retry only meets the lock again.
+    AccountLocked(String),
     BadPasscode(String),
     /// The trust-circle join failed a *signature* check, not the passcode. Kept
     /// apart from `BadPasscode` because the two need opposite advice: this one
@@ -128,6 +134,7 @@ impl PipelineError {
         match self {
             PipelineError::BadCredentials(_) => "bad_credentials",
             PipelineError::SigninRefused(_) => "signin_refused",
+            PipelineError::AccountLocked(_) => "account_locked",
             PipelineError::BadPasscode(_) => "bad_passcode",
             PipelineError::TrustCircleSignature(_) => TRUST_CIRCLE_SIGNATURE,
             PipelineError::DeviceNoShares(_) => "device_no_shares",
@@ -146,6 +153,7 @@ impl std::fmt::Display for PipelineError {
         match self {
             PipelineError::BadCredentials(m) => write!(f, "{m}"),
             PipelineError::SigninRefused(m) => write!(f, "{m}"),
+            PipelineError::AccountLocked(m) => write!(f, "{m}"),
             PipelineError::BadPasscode(m) => write!(f, "{m}"),
             PipelineError::TrustCircleSignature(m) => write!(f, "{m}"),
             PipelineError::DeviceNoShares(m) => write!(f, "{m}"),
@@ -323,6 +331,11 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
              said: \"{message}\" This is not Apple saying your password is wrong, \
              so entering it again won't help. Please try again later."
         )),
+        // Apple's own wording already names the way out (iForgot), so it is
+        // passed through like any credential verdict; only the code differs.
+        E::AuthSrpWithMessage(-20209, _) => {
+            PipelineError::AccountLocked(format!("Apple sign-in failed: {e}"))
+        }
         // Apple looked at the credentials and said no: `check_error` raises
         // `AuthSrpWithMessage` on a 200 with `ec != 0`, carrying wording more
         // specific than anything we would write (locked account, wrong
@@ -1117,6 +1130,28 @@ mod tests {
         assert_eq!(login_error(&other).code(), "bad_credentials");
     }
 
+    /// Between 2026-10-19 and 10-22 three sign-ins came back -20209, and as
+    /// `bad_credentials` each was a 401 telling the user to retype. One user
+    /// resubmitted four times in two minutes into a lock no password lifts.
+    /// The message is verbatim from the production log.
+    #[test]
+    fn login_error_reports_a_locked_account_as_its_own_code() {
+        use icloud_auth::Error as E;
+        let e = E::AuthSrpWithMessage(
+            -20209,
+            "This Apple Account has been locked for security reasons. Visit iForgot to \
+             reset your account (https://iforgot.apple.com)."
+                .into(),
+        );
+        let mapped = login_error(&e);
+        assert_eq!(mapped.code(), "account_locked");
+        // Apple's text carries the way out; it must reach the user intact.
+        assert!(mapped.to_string().contains("https://iforgot.apple.com"), "{mapped}");
+        // A wrong password is still a retype, not a lock.
+        let wrong = E::AuthSrpWithMessage(-22406, "Enter the correct password for this Apple Account.".into());
+        assert_eq!(login_error(&wrong).code(), "bad_credentials");
+    }
+
     #[test]
     fn escrow_error_shows_apples_message_not_the_reply_blob() {
         // The reply a user hit on 2026-10-18: the base64 respBlob was printed
@@ -1207,6 +1242,7 @@ mod tests {
     fn pipeline_error_codes_and_messages() {
         assert_eq!(PipelineError::BadCredentials("x".into()).code(), "bad_credentials");
         assert_eq!(PipelineError::SigninRefused("x".into()).code(), "signin_refused");
+        assert_eq!(PipelineError::AccountLocked("x".into()).code(), "account_locked");
         assert_eq!(PipelineError::BadPasscode("x".into()).code(), "bad_passcode");
         // Distinct from bad_passcode on purpose: a client that tells the user to
         // re-enter their passcode here would be telling them to retry the one

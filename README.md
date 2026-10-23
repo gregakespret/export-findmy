@@ -162,7 +162,7 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (a wrong password *or* a wrong 2FA code — Apple judged what was typed and
-rejected it), `signin_refused`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
+rejected it), `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
 `no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
 `apple_error`.
 
@@ -180,6 +180,11 @@ Apple has checked the password, so it says nothing either way about the
 credentials. Since 2026-10-13 it is what Apple returns for the Android
 anisette every v3 server runs; a Mac's anisette, through
 `--anisette-headers-url`, gets past it.
+
+`account_locked` (HTTP 403) is Apple's -20209: the Apple ID is locked for
+security reasons, often after several wrong passwords, and no password works
+until its owner unlocks it at iforgot.apple.com. `detail` is Apple's own text,
+which says so.
 
 `bad_passcode` (HTTP 400) is only Apple's escrow refusing the passcode itself
 (status -6015, "Credential is not verified."). Two join failures come after
