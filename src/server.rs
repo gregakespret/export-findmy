@@ -639,6 +639,9 @@ fn beacon_json(b: &BeaconExport) -> serde_json::Value {
 fn status_for(code: &str) -> StatusCode {
     match code {
         "bad_credentials" => StatusCode::UNAUTHORIZED,
+        // Apple refusing this account until its owner unlocks it: a 401 would
+        // say "retype", and nothing the caller sends gets past the lock.
+        "account_locked" => StatusCode::FORBIDDEN,
         "bad_passcode" | "bad_device_index" | "no_bottles" => StatusCode::BAD_REQUEST,
         // Not a malformed request: the passcode was right and the input was
         // valid. What conflicts is the state of the account's keychain trust
@@ -743,6 +746,7 @@ mod tests {
         // Apple refusing the sign-in is not the caller's to fix, so not the
         // 401 that `bad_credentials` gets.
         assert_eq!(status_for("signin_refused"), StatusCode::BAD_GATEWAY);
+        assert_eq!(status_for("account_locked"), StatusCode::FORBIDDEN);
         assert_eq!(status_for("bad_passcode"), StatusCode::BAD_REQUEST);
         assert_eq!(status_for("trust_circle_signature"), StatusCode::CONFLICT);
         // The passcode worked here too; a 400 would tell the user to retype it.
