@@ -338,8 +338,8 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         }
         // Apple looked at the credentials and said no: `check_error` raises
         // `AuthSrpWithMessage` on a 200 with `ec != 0`, carrying wording more
-        // specific than anything we would write (locked account, wrong
-        // password, expired code), so it is passed through.
+        // specific than anything we would write (wrong password, expired
+        // code), so it is passed through.
         //
         // `Bad2faCode` is the known soft spot in that rule. Its one raise site
         // is `if res.status() != 200` on `/auth/verify/phone/securitycode`, so

@@ -183,8 +183,8 @@ anisette every v3 server runs; a Mac's anisette, through
 
 `account_locked` (HTTP 403) is Apple's -20209: the Apple ID is locked for
 security reasons, often after several wrong passwords, and no password works
-until its owner unlocks it at iforgot.apple.com. `detail` is Apple's own text,
-which says so.
+until its owner unlocks it at iforgot.apple.com. `detail` carries Apple's own
+text, which says so.
 
 `bad_passcode` (HTTP 400) is only Apple's escrow refusing the passcode itself
 (status -6015, "Credential is not verified."). Two join failures come after
