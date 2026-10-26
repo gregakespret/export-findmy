@@ -87,7 +87,7 @@ logged.
 | Method & path | Body | Response |
 |---|---|---|
 | `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa","sent_to"}` (`sent_to`: Apple's masked number of the phone the code was texted to, e.g. `"+1 (•••) •••-••12"`, or `null`) — or `"awaiting_passcode"` + `devices` if Apple already trusts the session and skips 2FA |
-| `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":[{"serial","name","model"},…]}` |
+| `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":[{"serial","name","model"},…]}` — or `401 {"error":"bad_2fa_code","retryable":true,"state":"awaiting_2fa","sent_to",…}` when Apple refused the code and will take another for the same text (see below) |
 | `POST /sessions/{id}/escrow` | `{"device_index","passcode"}` | `200 {"state":"done","beacons":[…]}` |
 | `GET /healthz` | — | `200 {"status":"ok"}` |
 
@@ -162,7 +162,7 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (a wrong password *or* a wrong 2FA code — Apple judged what was typed and
-rejected it), `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
+rejected it), `bad_2fa_code`, `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
 `no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
 `apple_error`.
 
@@ -173,6 +173,17 @@ must not treat every `POST /sessions` failure as a wrong password: the whole
 point of the split is that `detail` now tells the user whether retyping the
 password can possibly help, so surface `detail` rather than a message of your
 own.
+
+`bad_2fa_code` (HTTP 401) is a wrong SMS code that **does not end the
+attempt**. Apple refused it with -21669 ("Try entering your verification code
+again.") and will take another code for the same text, so the login is still
+waiting: the body carries `"retryable": true`, `"state": "awaiting_2fa"` and
+`sent_to`, and the client should ask for the code again and post it to the same
+session. Starting over instead texts a new code, and the one the user has stops
+working. Nothing new is sent for a retype. A text gets three codes; the third
+refusal, or a refusal Apple marks as final, comes back as `bad_credentials` and
+retires the session. All of one text's codes share the 600s wait the first ask
+opened.
 
 `signin_refused` (HTTP 502) is Apple turning the sign-in itself away with
 -80045 "This action cannot be completed at this time." It can arrive before
