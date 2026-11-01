@@ -668,7 +668,9 @@ fn status_for(code: &str) -> StatusCode {
         // Not a malformed request: the passcode was right and the input was
         // valid. What conflicts is the state of the account's keychain trust
         // circle, which no correction to this request can fix.
-        "trust_circle_signature" | "device_no_shares" => StatusCode::CONFLICT,
+        "trust_circle_signature" | "trust_circle_signature_last_device" | "device_no_shares" => {
+            StatusCode::CONFLICT
+        }
         "session_not_found" => StatusCode::NOT_FOUND,
         "session_expired" => StatusCode::GONE,
         _ => StatusCode::BAD_GATEWAY,
@@ -771,6 +773,8 @@ mod tests {
         assert_eq!(status_for("account_locked"), StatusCode::FORBIDDEN);
         assert_eq!(status_for("bad_passcode"), StatusCode::BAD_REQUEST);
         assert_eq!(status_for("trust_circle_signature"), StatusCode::CONFLICT);
+        // The same failure, with no device left: still not the input's fault.
+        assert_eq!(status_for("trust_circle_signature_last_device"), StatusCode::CONFLICT);
         // The passcode worked here too; a 400 would tell the user to retype it.
         assert_eq!(status_for("device_no_shares"), StatusCode::CONFLICT);
         assert_eq!(status_for("bad_device_index"), StatusCode::BAD_REQUEST);
@@ -1285,6 +1289,34 @@ mod tests {
         ).await;
         assert_eq!(s2, StatusCode::OK, "second device never ran: {b2}");
         assert_eq!(b2["state"], "done");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_signature_failure_on_the_last_device_ends_the_attempt() {
+        // The retryable reply above tells the client to offer another device.
+        // With none left the pipeline reports its own code, and that reply is a
+        // plain failure: 409 from the code as the pipeline spells it (a typo on
+        // either side would fall to the 502 arm), no `retryable`, session gone.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                let e = PipelineError::TrustCircleSignatureLastDevice("Failed.".into());
+                Err::<Vec<BeaconExport>, _>(e)
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+        let (s1, b1) = req(
+            &st, "POST", &format!("/sessions/{id}/escrow"),
+            r#"{"device_index":0,"passcode":"0000"}"#,
+        ).await;
+        assert_eq!(s1, StatusCode::CONFLICT);
+        assert_eq!(b1["error"], "trust_circle_signature_last_device");
+        assert_eq!(b1["detail"], "Failed.");
+        assert!(b1.get("retryable").is_none(), "last-device failure offered a retry: {b1}");
+        assert!(st.sessions.lock().await.is_empty(), "ended attempt kept its session");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

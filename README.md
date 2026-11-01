@@ -110,8 +110,9 @@ rustpush collapses unrelated failures onto the same words, and only the variant
 name tells them apart. In particular **`Bad message` / `BadMsg` is a signature
 check inside escrow recovery, not a rejected passcode** — it is reached after
 the passcode has already opened the bottle, so it gets its own user-facing
-message (`trust_circle_signature`). A genuinely wrong passcode fails earlier,
-in the SRP exchange, as an escrow/HTTP error.
+message (`trust_circle_signature`, or `trust_circle_signature_last_device` when
+no untried device is left). A genuinely wrong passcode fails earlier, in the SRP
+exchange, as an escrow/HTTP error.
 
 Passwords, passcodes and 2FA codes are never logged — only their lengths, which
 is what distinguishes an empty field, or a Mac login password typed where a
@@ -162,7 +163,7 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (a wrong password *or* a wrong 2FA code — Apple judged what was typed and
-rejected it), `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
+rejected it), `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `trust_circle_signature_last_device`, `device_no_shares`, `bad_device_index`,
 `no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
 `sms_refused`, `anisette_unavailable`, `extractor_panic`, `apple_error`.
 
@@ -211,7 +212,12 @@ client should re-render device selection from that list, index into it, and
 post to the same session rather than starting over. Up to three devices may be
 tried per attempt; the last failure comes back without `retryable` and retires
 the session as any other failure does. On an account with one trusted device,
-its `detail` says so instead of suggesting another device. A client that
+its `detail` says so instead of suggesting another device. When that last
+failure is a signature failure and no untried device is left (the account's
+only one, or every one tried), its code is `trust_circle_signature_last_device`
+(HTTP 409), so a client can tell "try another device" from "there is none".
+Ended by the three-device cap with devices still untried, it stays
+`trust_circle_signature`. A client that
 ignores `retryable` and treats the 409 as fatal still behaves correctly, just
 less kindly.
 

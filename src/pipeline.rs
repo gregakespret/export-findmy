@@ -118,6 +118,11 @@ pub enum PipelineError {
     /// bottle, so "check your passcode" sends the user round a loop that cannot
     /// terminate. Trying a different trusted device is the way out.
     TrustCircleSignature(String),
+    /// A `TrustCircleSignature` that ends the attempt with no untried device
+    /// left: the account's only one, or every one tried. Its own code because
+    /// `trust_circle_signature` tells a client another device is the way
+    /// through, and here there is none to pick. See [`ending_error`].
+    TrustCircleSignatureLastDevice(String),
     /// The chosen device's peer holds no keychain key shares for us, so there
     /// is nothing to join with. Reached after the passcode has worked, like
     /// `TrustCircleSignature`; picking another trusted device gets past it.
@@ -149,6 +154,7 @@ impl PipelineError {
             PipelineError::AccountLocked(_) => "account_locked",
             PipelineError::BadPasscode(_) => "bad_passcode",
             PipelineError::TrustCircleSignature(_) => TRUST_CIRCLE_SIGNATURE,
+            PipelineError::TrustCircleSignatureLastDevice(_) => "trust_circle_signature_last_device",
             PipelineError::DeviceNoShares(_) => "device_no_shares",
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
             PipelineError::NoBottles => "no_bottles",
@@ -170,6 +176,7 @@ impl std::fmt::Display for PipelineError {
             PipelineError::AccountLocked(m) => write!(f, "{m}"),
             PipelineError::BadPasscode(m) => write!(f, "{m}"),
             PipelineError::TrustCircleSignature(m) => write!(f, "{m}"),
+            PipelineError::TrustCircleSignatureLastDevice(m) => write!(f, "{m}"),
             PipelineError::DeviceNoShares(m) => write!(f, "{m}"),
             PipelineError::BadDeviceIndex(m) => write!(f, "{m}"),
             PipelineError::NoBottles => {
@@ -310,6 +317,20 @@ fn with_next_step(err: PipelineError, next: &str) -> PipelineError {
             PipelineError::TrustCircleSignature(format!("{m} {next}"))
         }
         PipelineError::DeviceNoShares(m) => PipelineError::DeviceNoShares(format!("{m} {next}")),
+        other => other,
+    }
+}
+
+/// The error a device-side failure ends the attempt with, given how many
+/// devices are still untried. With none left, a signature failure becomes
+/// [`PipelineError::TrustCircleSignatureLastDevice`]: a client keyed on
+/// `trust_circle_signature` offers another device, which the detail has just
+/// said does not exist. Any other error is returned as it is.
+fn ending_error(err: PipelineError, untried: usize) -> PipelineError {
+    match err {
+        PipelineError::TrustCircleSignature(m) if untried == 0 => {
+            PipelineError::TrustCircleSignatureLastDevice(m)
+        }
         other => other,
     }
 }
@@ -780,7 +801,7 @@ pub async fn run_export(
         if untried.is_empty() || !attempts_left {
             log!("   => no retry ({}); ending the attempt",
                  if untried.is_empty() { "no untried device" } else { "attempts spent" });
-            return Err(err);
+            return Err(ending_error(err, untried.len()));
         }
         // Round again: `join_retryable` lets the driver report this, and the
         // next `choose_bottle` collects another device.
@@ -1302,6 +1323,24 @@ mod tests {
         assert_eq!(e.to_string(), "No shares. Next.");
         let e = with_next_step(PipelineError::Apple("Down.".into()), "Next.");
         assert_eq!(e.to_string(), "Down.");
+    }
+
+    #[test]
+    fn a_signature_failure_with_no_device_left_says_so_in_its_code() {
+        // `trust_circle_signature` tells a client that another device is the
+        // way through. With none left to pick, a client keyed on the code sends
+        // the user after a device the detail says they do not have.
+        let e = ending_error(PipelineError::TrustCircleSignature("Failed.".into()), 0);
+        assert_eq!(e.code(), "trust_circle_signature_last_device");
+        // Only the code changes: the detail a client shows is the one it had.
+        assert_eq!(e.to_string(), "Failed.");
+        // Ended by the attempt cap with devices still untried: another device
+        // is still the way through, so the code keeps saying so.
+        let capped = ending_error(PipelineError::TrustCircleSignature("x".into()), 2);
+        assert_eq!(capped.code(), "trust_circle_signature");
+        // Only the signature failure is renamed.
+        let no_shares = ending_error(PipelineError::DeviceNoShares("x".into()), 0);
+        assert_eq!(no_shares.code(), "device_no_shares");
     }
 
     #[test]
