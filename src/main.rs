@@ -225,9 +225,16 @@ fn disable_echo_read() -> String {
 
 // ── Main ────────────────────────────────────────────────────────────────
 
-fn arg_err(flag: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Missing value for {flag}");
-    Ok(())
+/// A start command this binary cannot act on: exit 2, the usage-error status,
+/// so a deploy whose command lost or mangled a flag fails where it shows
+/// instead of exiting 0 and reading as a clean run.
+fn usage_error(msg: &str) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(2)
+}
+
+fn arg_err(flag: &str) -> ! {
+    usage_error(&format!("Missing value for {flag}"))
 }
 
 #[tokio::main]
@@ -254,7 +261,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut apple_id = String::new();
-    let mut anisette = AnisetteServer::V3("https://ani.sidestore.io".to_string());
+    let mut anisette_url = None;
+    let mut anisette_headers_url = None;
     let mut output_dir = PathBuf::from(".");
     let mut debug = false;
     let mut serve = false;
@@ -267,28 +275,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 match args.get(i) {
                     Some(v) => apple_id = v.clone(),
-                    None => return arg_err("--apple-id"),
+                    None => arg_err("--apple-id"),
                 }
             }
             "--anisette-url" => {
                 i += 1;
                 match args.get(i) {
-                    Some(v) => anisette = AnisetteServer::V3(v.clone()),
-                    None => return arg_err("--anisette-url"),
+                    Some(v) => anisette_url = Some(v.clone()),
+                    None => arg_err("--anisette-url"),
                 }
             }
             "--anisette-headers-url" => {
                 i += 1;
                 match args.get(i) {
-                    Some(v) => anisette = AnisetteServer::Headers(v.clone()),
-                    None => return arg_err("--anisette-headers-url"),
+                    Some(v) => anisette_headers_url = Some(v.clone()),
+                    None => arg_err("--anisette-headers-url"),
                 }
             }
             "--output-dir" => {
                 i += 1;
                 match args.get(i) {
                     Some(v) => output_dir = PathBuf::from(v),
-                    None => return arg_err("--output-dir"),
+                    None => arg_err("--output-dir"),
                 }
             }
             "--debug" => {
@@ -301,10 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<u16>().ok()) {
                     Some(p) => port = p,
-                    None => {
-                        eprintln!("--port needs a valid port number (1-65535)");
-                        return Ok(());
-                    }
+                    None => usage_error("--port needs a valid port number (1-65535)"),
                 }
             }
             "--help" | "-h" => {
@@ -312,10 +317,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --apple-id <email>       Apple ID email");
-                eprintln!("  --anisette-url <url>     Anisette server URL (default: https://ani.sidestore.io)");
+                eprintln!("  --anisette-url <url>     Anisette server URL (default: {})", anisette::DEFAULT_V3_URL);
                 eprintln!("  --anisette-headers-url <url>");
                 eprintln!("                           Server returning a Mac's anisette headers as JSON on GET;");
-                eprintln!("                           replaces --anisette-url");
+                eprintln!("                           use instead of --anisette-url, not with it");
                 eprintln!("  --output-dir <dir>       Output directory for plist files (default: .)");
                 eprintln!("  --debug                  Print CloudKit record-type breakdown and per-record details");
                 eprintln!("  --serve                  Run the localhost REST API instead of the CLI export");
@@ -325,12 +330,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("WARNING: Output plist files contain private key material.");
                 return Ok(());
             }
-            _ => {
-                eprintln!("Unknown argument: {}", args[i]);
-                return Ok(());
-            }
+            // A value whose flag went missing would be echoed here, and a
+            // headers URL is an access secret: only something flag-shaped is.
+            arg if arg.starts_with('-') => usage_error(&format!("Unknown argument: {arg}")),
+            _ => usage_error("Unexpected value: every argument must follow its flag"),
         }
         i += 1;
+    }
+
+    let no_anisette_flag = anisette_url.is_none() && anisette_headers_url.is_none();
+    let anisette = AnisetteServer::from_flags(anisette_url, anisette_headers_url).unwrap_or_else(|e| usage_error(&e));
+    // Every v3 server provisions Android ADI, which Apple has refused with
+    // -80045 since 2026-10-13, so a boot that resolves to one, the default or an
+    // explicit --anisette-url, will fail every sign-in. A start command that
+    // loses its --anisette-headers-url lands here: a 2026-10-14 redeploy
+    // replayed one without the flag, booted green and failed every connect.
+    // Say so at boot rather than per connect.
+    if let AnisetteServer::V3(_) = &anisette {
+        log::warn!(
+            "{}signing in through {anisette}, whose Android anisette Apple has refused with -80045 \
+             since 2026-10-13; pass --anisette-headers-url for a Mac's headers",
+            if no_anisette_flag { "no --anisette-url or --anisette-headers-url given, so " } else { "" }
+        );
     }
 
     if serve {

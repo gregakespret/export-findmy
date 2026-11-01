@@ -749,7 +749,7 @@ pub async fn serve(port: u16, anisette: AnisetteServer) -> Result<(), Box<dyn st
     // IPv6 private network) to reach the service from another container.
     let bind_host = std::env::var("EXPORT_FINDMY_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     let listener = tokio::net::TcpListener::bind((bind_host.as_str(), port)).await?;
-    eprintln!("export-findmy serving on http://{bind_host}:{port}");
+    eprintln!("export-findmy serving on http://{bind_host}:{port}, anisette from {}", state.anisette);
     axum::serve(listener, router(state)).await?;
     Ok(())
 }

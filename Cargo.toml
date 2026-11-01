@@ -28,3 +28,5 @@ chrono = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Paused clock, so a timeout test does not wait out the real timeout.
+tokio = { version = "1", features = ["test-util"] }

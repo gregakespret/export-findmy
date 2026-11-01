@@ -37,7 +37,7 @@ The tool will prompt for:
 |------|-------------|---------|
 | `--apple-id <email>` | Apple ID email | prompted if omitted |
 | `--anisette-url <url>` | Anisette v3 server URL | `https://ani.sidestore.io` |
-| `--anisette-headers-url <url>` | Server returning a real Mac's anisette headers as JSON on `GET`; replaces `--anisette-url`. Since 2026-10-13 Apple refuses (-80045) the Android anisette every v3 server runs. Use a Mac that is not in your own iCloud Keychain circle: its machine id becomes this run's keychain peer id | — |
+| `--anisette-headers-url <url>` | Server returning a real Mac's anisette headers as JSON on `GET`; use instead of `--anisette-url`, not with it. Since 2026-10-13 Apple refuses (-80045) the Android anisette every v3 server runs. Use a Mac that is not in your own iCloud Keychain circle: its machine id becomes this run's keychain peer id | — |
 | `--output-dir <dir>` | Where to write plist files | `.` |
 | `--serve` | Run the localhost REST API instead of the CLI export (see below) | off |
 | `--port <n>` | Port for `--serve` (binds `127.0.0.1` only) | `5301` |
@@ -47,7 +47,7 @@ The tool will prompt for:
 ```
 $ ./target/release/export-findmy --apple-id xxxx@xxx --output-dir ./keys
 Password:
-[xxxx@xxx] [sess=cli] [1/7] Connecting to anisette server (https://ani.sidestore.io)...
+[xxxx@xxx] [sess=cli] [1/7] Connecting to anisette server (https://ani.sidestore.io (v3))...
 [xxxx@xxx] [sess=cli] [2/7] Logging in to Apple ID...
 2FA code: 123456
 [xxxx@xxx] [sess=cli]   Logged in (dsid=......) after 4.2s
