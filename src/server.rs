@@ -1222,6 +1222,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_signature_failure_on_the_last_device_ends_the_attempt() {
+        // The retryable reply above tells the client to offer another device.
+        // With none left the pipeline reports its own code, and that reply is a
+        // plain failure: 409 from the code as the pipeline spells it (a typo on
+        // either side would fall to the 502 arm), no `retryable`, session gone.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                let e = PipelineError::TrustCircleSignatureLastDevice("Failed.".into());
+                Err::<Vec<BeaconExport>, _>(e)
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+        let (s1, b1) = req(
+            &st, "POST", &format!("/sessions/{id}/escrow"),
+            r#"{"device_index":0,"passcode":"0000"}"#,
+        ).await;
+        assert_eq!(s1, StatusCode::CONFLICT);
+        assert_eq!(b1["error"], "trust_circle_signature_last_device");
+        assert_eq!(b1["detail"], "Failed.");
+        assert!(b1.get("retryable").is_none(), "last-device failure offered a retry: {b1}");
+        assert!(st.sessions.lock().await.is_empty(), "ended attempt kept its session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_bad_credentials_returns_401_and_retires_session() {
         let st = state_with(spawn_err(|| PipelineError::BadCredentials("nope".into())));
 

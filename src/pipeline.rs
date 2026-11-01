@@ -1264,13 +1264,10 @@ mod tests {
         // `trust_circle_signature` tells a client that another device is the
         // way through. With none left to pick, a client keyed on the code sends
         // the user after a device the detail says they do not have.
-        let only = with_next_step(
-            PipelineError::TrustCircleSignature("Failed.".into()),
-            next_step(1, 0, true),
-        );
-        let e = ending_error(only, 0);
+        let e = ending_error(PipelineError::TrustCircleSignature("Failed.".into()), 0);
         assert_eq!(e.code(), "trust_circle_signature_last_device");
-        assert!(e.to_string().starts_with("Failed. It is the only trusted device"), "{e}");
+        // Only the code changes: the detail a client shows is the one it had.
+        assert_eq!(e.to_string(), "Failed.");
         // Ended by the attempt cap with devices still untried: another device
         // is still the way through, so the code keeps saying so.
         let capped = ending_error(PipelineError::TrustCircleSignature("x".into()), 2);
