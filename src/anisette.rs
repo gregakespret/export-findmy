@@ -39,15 +39,22 @@ impl AnisetteServer {
     /// server that fails every connect. The errors never echo the URL, whose
     /// path is a headers server's access secret.
     pub fn from_flags(v3: Option<String>, headers: Option<String>) -> Result<Self, String> {
-        let (flag, url, server) = match (v3, headers) {
+        let (flag, url, server): (&str, String, fn(String) -> Self) = match (v3, headers) {
             (Some(_), Some(_)) => return Err("pass --anisette-url or --anisette-headers-url, not both".into()),
             (None, None) => return Ok(Self::V3(DEFAULT_V3_URL.into())),
-            (Some(url), None) => ("--anisette-url", url.clone(), Self::V3(url)),
-            (None, Some(url)) => ("--anisette-headers-url", url.clone(), Self::Headers(url)),
+            (Some(url), None) => ("--anisette-url", url, Self::V3),
+            (None, Some(url)) => ("--anisette-headers-url", url, Self::Headers),
         };
+        // Stored trimmed: the URL parser forgives surrounding whitespace (an env
+        // var that expanded with a trailing newline), but the v3 provider appends
+        // its path to the stored string with format!, and "https://host\n/v3/..."
+        // fails every connect, which is what this check exists to prevent.
+        let url = url.trim().to_owned();
+        if url.is_empty() {
+            return Err(format!("{flag} is empty"));
+        }
         match Url::parse(&url) {
-            _ if url.trim().is_empty() => Err(format!("{flag} is empty")),
-            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") && parsed.has_host() => Ok(server),
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") && parsed.has_host() => Ok(server(url)),
             _ => Err(format!("{flag} is not an http(s) URL")),
         }
     }
@@ -192,12 +199,15 @@ mod tests {
     #[test]
     fn misconfigured_anisette_flags_are_refused_without_echoing_the_url() {
         let headers = |url: &str| AnisetteServer::from_flags(None, Some(url.into()));
+        let v3 = |url: &str| AnisetteServer::from_flags(Some(url.into()), None);
         let both = AnisetteServer::from_flags(Some("https://ani.example".into()), Some("https://mac.example/s3cret".into()));
+        // The reason names the flag, so the operator knows which value to fix.
         for (result, reason) in [
-            (headers(""), "empty"),
-            (headers("  "), "empty"),
-            (headers("mac.example/s3cret"), "not an http(s) URL"),
-            (headers("ftp://mac.example/s3cret"), "not an http(s) URL"),
+            (headers(""), "--anisette-headers-url is empty"),
+            (headers("  "), "--anisette-headers-url is empty"),
+            (headers("mac.example/s3cret"), "--anisette-headers-url is not an http(s) URL"),
+            (headers("ftp://mac.example/s3cret"), "--anisette-headers-url is not an http(s) URL"),
+            (v3("ani.example"), "--anisette-url is not an http(s) URL"),
             (both, "not both"),
         ] {
             let error = result.unwrap_err();
@@ -212,6 +222,14 @@ mod tests {
         assert_eq!(AnisetteServer::from_flags(Some("http://localhost:6969".into()), None),
                    Ok(AnisetteServer::V3("http://localhost:6969".into())));
         assert_eq!(AnisetteServer::from_flags(None, None), Ok(AnisetteServer::V3(DEFAULT_V3_URL.into())));
+    }
+
+    /// An env var that expanded with a trailing newline still parses as a URL,
+    /// but the v3 provider appends "/v3/get_headers" to the stored string as is.
+    #[test]
+    fn anisette_flag_values_are_stored_trimmed() {
+        assert_eq!(AnisetteServer::from_flags(Some(" http://localhost:6969\n".into()), None),
+                   Ok(AnisetteServer::V3("http://localhost:6969".into())));
     }
 
     /// The Mac sleeps, or the tunnel takes the connection and never answers.
