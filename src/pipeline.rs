@@ -23,6 +23,7 @@ use rustpush::findmy::{
     BeaconAccessory, BeaconNamingRecord, BeaconRatchet, KeyAlignmentRecord,
     MasterBeaconRecord, SharedBeaconRecord, FIND_MY_SERVICE, SEARCH_PARTY_CONTAINER,
 };
+use icloud_auth::TfaPrompt;
 use rustpush::keychain::{KeychainClient, KeychainClientState};
 use rustpush::{
     login_apple_delegates, APSState, AppleAccount, DebugMutex, DebugRwLock, LoginDelegate,
@@ -365,7 +366,11 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         // it properly means splitting the status check upstream in rustpush.
         // The trusted-device path is unaffected — `verify_2fa` goes through
         // `check_error`, so a wrong code there arrives as `AuthSrpWithMessage`.
-        E::AuthSrpWithMessage(..) | E::Bad2faCode => {
+        //
+        // `IncorrectCode` is the retypable kind of wrong code, which `login`
+        // answers by asking for the code again; it reaches here only from a
+        // direct `verify_sms_2fa` call, and means the same thing.
+        E::AuthSrpWithMessage(..) | E::Bad2faCode | E::IncorrectCode => {
             PipelineError::BadCredentials(format!("Apple sign-in failed: {e}"))
         }
         // The credentials are fine; the *account* is in a state that blocks
@@ -422,12 +427,14 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
 
 /// Supplies the three inputs that arrive mid-login. Must be `Send + Sync` so the
 /// server can drive the pipeline from a spawned task (`&dyn Interact` is captured
-/// by the login closure). `get_2fa_code` returns `String` because rustpush's
-/// login closure is `Fn(Option<&str>) -> String`; an empty string makes login
-/// fail cleanly. `sent_to` is Apple's masked number of the phone the code was
-/// texted to (e.g. "+1 (•••) •••-••12"), `None` when rustpush could not tell.
+/// by the login closure). `get_2fa_code` is rustpush's login closure: the prompt
+/// carries `sent_to`, Apple's masked number of the phone the code was texted to
+/// (e.g. "+1 (•••) •••-••12", `None` when rustpush could not tell), and
+/// `refused`, how many codes Apple has refused for that text; above 0 the ask is
+/// a retype of the same text. `None` (no code arrived) fails the login without
+/// sending Apple anything.
 pub trait Interact: Send + Sync {
-    fn get_2fa_code(&self, sent_to: Option<&str>) -> String;
+    fn get_2fa_code(&self, prompt: TfaPrompt<'_>) -> Option<String>;
     fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError>;
     fn get_passcode(&self) -> Result<String, PipelineError>;
     /// A join failed in a way a *different* device can get past, and the
@@ -443,6 +450,24 @@ pub trait Interact: Send + Sync {
 /// recovery against Apple, and an unbounded loop would let a stuck client spend
 /// them all.
 const MAX_JOIN_ATTEMPTS: usize = 3;
+
+/// How many codes the user may type for one text before the sign-in is spent.
+/// Enough for a typo and then the stale-text mix-up (a code from an earlier
+/// attempt's text), which are the refusals production shows. Not more: each
+/// refused code counts toward Apple locking the account, and once the text is
+/// the problem a fresh sign-in, which sends a new one, is the way through.
+/// Apple can stop the retypes sooner (see `icloud_auth::TfaPrompt`).
+const MAX_CODE_TRIES: u32 = 3;
+
+/// The next 2FA code for the login, or `None` once `MAX_CODE_TRIES` codes for
+/// this text have been refused, which fails the sign-in as a wrong code
+/// without asking the user for another.
+fn next_code(io: &dyn Interact, prompt: TfaPrompt<'_>) -> Option<String> {
+    if prompt.refused >= MAX_CODE_TRIES {
+        return None;
+    }
+    io.get_2fa_code(prompt)
+}
 
 pub struct ExportOpts {
     pub apple_id: String,
@@ -552,7 +577,12 @@ pub async fn run_export(
     let apple_id_clone = opts.apple_id.clone();
     let password_hash: Vec<u8> = Sha256::digest(opts.password.as_bytes()).to_vec();
     let appleid_closure = move || (apple_id_clone.clone(), password_hash.clone());
-    let tfa_closure = |sent_to: Option<&str>| io.get_2fa_code(sent_to);
+    let tfa_closure = |prompt: TfaPrompt<'_>| {
+        if prompt.refused > 0 {
+            log!("   Apple refused code {}/{} for this text", prompt.refused, MAX_CODE_TRIES);
+        }
+        next_code(io, prompt)
+    };
 
     let account =
         AppleAccount::login(appleid_closure, tfa_closure, login_info, anisette_client.clone())
@@ -985,6 +1015,35 @@ fn rfc3339_secs(t: SystemTime) -> String {
 mod tests {
     use super::*;
 
+    /// Counts how often the user was asked for a code.
+    struct CodeAsks(std::sync::Mutex<u32>);
+
+    impl Interact for CodeAsks {
+        fn get_2fa_code(&self, _prompt: TfaPrompt<'_>) -> Option<String> {
+            *self.0.lock().unwrap() += 1;
+            Some("123456".into())
+        }
+        fn choose_bottle(&self, _devices: &[DeviceInfo]) -> Result<usize, PipelineError> {
+            unreachable!()
+        }
+        fn get_passcode(&self) -> Result<String, PipelineError> {
+            unreachable!()
+        }
+    }
+
+    /// A wrong code is retyped into the same sign-in, but not without end:
+    /// every refused code counts toward Apple locking the account, so after
+    /// the last try the login fails without asking the user again.
+    #[test]
+    fn a_text_gets_max_code_tries_codes_then_the_sign_in_fails() {
+        let io = CodeAsks(std::sync::Mutex::new(0));
+        for refused in 0..MAX_CODE_TRIES {
+            assert!(next_code(&io, TfaPrompt { sent_to: None, refused }).is_some(), "{refused}");
+        }
+        assert_eq!(next_code(&io, TfaPrompt { sent_to: None, refused: MAX_CODE_TRIES }), None);
+        assert_eq!(*io.0.lock().unwrap(), MAX_CODE_TRIES, "asked the user past the last try");
+    }
+
     /// Only the sign-in identity changes: the service requests that follow keep
     /// FakeIOSConfig's iPhone identity and iosbuddy endpoint, as before 2026-10-13.
     #[test]
@@ -1171,6 +1230,7 @@ mod tests {
         assert!(mapped.to_string().contains("Enter the correct password"), "{mapped}");
 
         assert_eq!(login_error(&E::Bad2faCode).code(), "bad_credentials");
+        assert_eq!(login_error(&E::IncorrectCode).code(), "bad_credentials");
     }
 
     /// From 2026-10-13 00:40 UTC Apple answered every sign-in with -80045, and
