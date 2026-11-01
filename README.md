@@ -171,8 +171,9 @@ from a GSA endpoint, an HTML error page where a plist was promised — is
 `apple_error` (HTTP 502), **not** `bad_credentials`. Three failures that used to
 share `apple_error` have their own code, also HTTP 502, because each needs
 different handling: `sms_refused` is Apple declining to text the 2FA code
-(HTTP 423, a send limit that only waiting lifts), `anisette_unavailable` is the
-anisette provisioning host failing, and `extractor_panic` is a bug in this
+(Apple answers the send with its own HTTP 423: a send limit that only waiting
+lifts), `anisette_unavailable` is the anisette provisioning host failing,
+whether at first contact or mid-login, and `extractor_panic` is a bug in this
 tool. Clients
 must not treat every `POST /sessions` failure as a wrong password: the whole
 point of the split is that `detail` now tells the user whether retyping the

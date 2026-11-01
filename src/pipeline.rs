@@ -395,10 +395,13 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         // production logs carried, and the one that means "locked", not
         // "broken". Any other status could be Apple's endpoint failing, so it
         // stays `apple_error` and still alerts.
+        // The reason is shown in parentheses, not as a quote "Apple said":
+        // when the 423 body carries no message, rustpush substitutes its own
+        // fallback sentence, which Apple never wrote.
         E::SmsSendFailed { status: 423, message } => PipelineError::SmsRefused(format!(
-            "Apple won't text a verification code to your phone right now. Apple \
-             said: \"{message}\" This is a limit on Apple's side, not a problem \
-             with your Apple ID or password, so trying again straight away won't \
+            "Apple won't text a verification code to your phone right now \
+             ({message}). This is a limit on Apple's side, not a problem with \
+             your Apple ID or password, so trying again straight away won't \
              help. Please wait a few hours, then try again."
         )),
         E::SmsSendFailed { .. } => PipelineError::Apple(format!("Apple sign-in failed: {e}")),
@@ -526,11 +529,18 @@ pub async fn run_export(
     )));
     if let AnisetteServer::Headers(_) = &opts.anisette {
         let identity = anisette_client.lock().await.get_headers().await
-            .map(|headers| headers["X-Mme-Client-Info"].clone())
+            .map_err(|e| format!("{e} [{e:?}]"))
+            // A host that answers without this header is as unusable as one
+            // that is down; indexing the map would panic the task instead.
+            .and_then(|headers| headers.get("X-Mme-Client-Info").cloned()
+                .ok_or_else(|| "headers host sent no X-Mme-Client-Info".to_string()))
             .map_err(|e| {
-                log!("!! FAILED at [1/7] anisette after {:.1}s: {} [{:?}]",
-                     started.elapsed().as_secs_f32(), e, e);
-                PipelineError::Apple(LOGIN_ANISETTE.to_string())
+                log!("!! FAILED at [1/7] anisette after {:.1}s: {}",
+                     started.elapsed().as_secs_f32(), e);
+                // The same host `login_error` reports as `anisette_unavailable`
+                // for `ErrorGettingAnisette`; this is its first contact, so an
+                // outage lands here, not there.
+                PipelineError::AnisetteUnavailable
             })?;
         // Device model and OS only: which identity Apple was shown.
         log!("  Signing in as anisette machine {}", identity);

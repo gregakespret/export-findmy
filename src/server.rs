@@ -92,6 +92,11 @@ fn join_failure(e: &tokio::task::JoinError) -> String {
     }
 }
 
+/// The step a pipeline error ends the session on: its wire code and `detail`.
+fn failed(e: &PipelineError) -> Step {
+    Step::Failed { error: e.code(), detail: e.to_string() }
+}
+
 /// Where the pipeline currently is; published on a watch channel so handlers can
 /// await transitions.
 #[derive(Debug, Clone)]
@@ -278,12 +283,12 @@ where
                 Ok(Err(e)) => {
                     slog!(id, "export failed after {:.1}s: code={} detail={:?}",
                           started.elapsed().as_secs_f32(), e.code(), e.to_string());
-                    Step::Failed { error: e.code(), detail: e.to_string() }
+                    failed(&e)
                 }
                 Err(e) => {
-                    // The user gets a deliberately vague message here; the log
-                    // is the only place the actual panic is recorded against
-                    // the session it killed.
+                    // The user gets a fixed sentence either way; the log is
+                    // the only place the actual panic is recorded against the
+                    // session it killed.
                     slog!(id, "export task {} after {:.1}s",
                           join_failure(&e), started.elapsed().as_secs_f32());
                     if e.is_cancelled() {
@@ -292,8 +297,7 @@ where
                         // waiting on it (a double-submitted /2fa whose twin
                         // timed out and aborted) is still handed this step, and
                         // `extractor_panic` would page us for a timeout.
-                        let aborted = PipelineError::Aborted;
-                        Step::Failed { error: aborted.code(), detail: aborted.to_string() }
+                        failed(&PipelineError::Aborted)
                     } else {
                         // A panic is our bug, so not `apple_error`: that sent the
                         // search to Apple, and the old "failed unexpectedly" left a
