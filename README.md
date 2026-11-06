@@ -197,7 +197,11 @@ picked; without one, to phone id 1, the account's oldest number. When that is no
 the user's phone, `POST /sessions/{id}/sms` with one of `other_phones` texts that
 phone instead. It is a new text, with its own three codes and 600s, and its code
 is the one to post. A `phone_id` not in
-`other_phones` is `unknown_phone` (HTTP 400) and leaves the session as it was.
+`other_phones` is `unknown_phone` (HTTP 400) and leaves the session as it was;
+its body carries `retryable`, `state`, `sent_to` and `other_phones` like
+`bad_2fa_code`. A switch posted while a code is with Apple sends nothing: if
+Apple refuses that code, `/sms` answers with the same `bad_2fa_code` body as
+`/2fa`, and if the code got through, `wrong_step` (409) with the session kept.
 If Apple will not send the new text (`sms_refused`), the attempt ends. Each
 phone choice logs one line:
 

@@ -176,10 +176,13 @@ impl Interact for CliInteract {
             if input.is_empty() {
                 return None;
             }
-            let Some(id) = input.strip_prefix("text ") else {
+            // Any case, space or not: "Text 2" or "text2" posted as a code would
+            // spend one of the text's tries, and a step toward Apple's lock.
+            let switch = input.get(..4).filter(|w| w.eq_ignore_ascii_case("text"));
+            let Some(id) = switch.map(|_| input[4..].trim()) else {
                 return Some(TfaAnswer::Code(input.to_string()));
             };
-            match id.trim().parse() {
+            match id.parse() {
                 Ok(id) if others.iter().any(|p| p.id == id) => return Some(TfaAnswer::TextPhone(id)),
                 _ => eprintln!("{id:?} is not one of the phones above."),
             }

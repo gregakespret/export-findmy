@@ -600,18 +600,7 @@ async fn submit_2fa(
             sent_to, other_phones, retry: Some(RetryNotice { error, detail }), ..
         }) => {
             slog!(id, "POST /2fa -> {error}, retryable: session stays at awaiting_2fa");
-            (
-                status_for(error),
-                Json(json!({
-                    "error": error,
-                    "detail": detail,
-                    "state": "awaiting_2fa",
-                    "retryable": true,
-                    "sent_to": sent_to,
-                    "other_phones": other_phones,
-                })),
-            )
-                .into_response()
+            tfa_kept(error, detail, sent_to, other_phones)
         }
         // A later ask with no retry is a code for a new text, not a retype of
         // this one. The API has no answer for that, so the attempt still ends,
@@ -667,27 +656,30 @@ async fn submit_sms(
         Err(r) => return r,
     };
     // One borrow, for the reason given in `submit_2fa`.
-    let (current, posted_against, listed) = {
+    let (current, awaiting) = {
         let step = session.step_rx.borrow();
-        match &*step {
-            Step::AwaitingTfa { ask, other_phones, .. } => {
-                (step_name(&step), Some(*ask), other_phones.iter().any(|p| p.id == body.phone_id))
+        let awaiting = match &*step {
+            Step::AwaitingTfa { ask, sent_to, other_phones, .. } => {
+                Some((*ask, sent_to.clone(), other_phones.clone()))
             }
-            _ => (step_name(&step), None, false),
-        }
+            _ => None,
+        };
+        (step_name(&step), awaiting)
     };
     slog!(id, "POST /sms: phone id {}, session at {}", body.phone_id, current);
-    let Some(posted_against) = posted_against else {
+    let Some((posted_against, sent_to, other_phones)) = awaiting else {
         slog!(id, "POST /sms rejected: session is at {}, not awaiting_2fa", current);
         return wrong_step();
     };
     // Only a phone the client was offered: the login would pass any other id to
     // Apple, spending one of the account's texts on a refusal.
-    if !listed {
+    if !other_phones.iter().any(|p| p.id == body.phone_id) {
         slog!(id, "POST /sms rejected: phone id {} is not one of the other phones", body.phone_id);
-        return error_response(
+        return tfa_kept(
             "unknown_phone",
             "That phone is not one of this Apple ID's other trusted phones.".into(),
+            sent_to,
+            other_phones,
         );
     }
     let _ = session.tfa_tx.send((posted_against, TfaAnswer::TextPhone(body.phone_id)));
@@ -698,6 +690,16 @@ async fn submit_sms(
     })
     .await;
     match next {
+        // The retype of the text already sent, not a new text: a code posted to
+        // `/2fa` reached Apple first, Apple refused it, and the login dropped
+        // this switch as stale. Nothing was texted, so answering with the new
+        // text's 200 would send the user to wait for a text that never comes.
+        Some(Step::AwaitingTfa {
+            sent_to, other_phones, retry: Some(RetryNotice { error, detail }), ..
+        }) => {
+            slog!(id, "POST /sms -> {error}: a code was checked first, so nothing was texted");
+            tfa_kept(error, detail, sent_to, other_phones)
+        }
         Some(Step::AwaitingTfa { sent_to, other_phones, .. }) => {
             slog!(id, "POST /sms -> awaiting_2fa for the new text");
             (
@@ -720,12 +722,14 @@ async fn submit_sms(
             retire(&st, id).await;
             error_response("apple_error", "Timed out waiting for Apple.".into())
         }
+        // A code posted to `/2fa` got through first: the session stays at
+        // awaiting_2fa until the login reaches the devices, so a switch can land
+        // after 2FA passed. That `/2fa` is answering with the devices; aborting
+        // here would kill the sign-in under it.
         Some(other) => {
-            slog!(id, "POST /sms: left awaiting_2fa for {} — aborting the attempt",
-                  step_name(&other));
-            session.abort.abort();
-            retire(&st, id).await;
-            error_response("apple_error", "Timed out waiting for Apple.".into())
+            slog!(id, "POST /sms: login moved on to {} (a code got through first) — \
+                   switch dropped, session kept", step_name(&other));
+            wrong_step()
         }
     }
 }
@@ -853,6 +857,26 @@ async fn remove(st: &AppState, id: Uuid) {
 async fn retire(st: &AppState, id: Uuid) {
     st.sessions.lock().await.remove(&id);
     st.expired.lock().await.insert(id);
+}
+
+/// An error that keeps the session waiting on a code. `retryable` and `state` are
+/// what tell a client the session is still live, so every such error carries
+/// them, with the phone the text went to and the ones `/sms` can text instead.
+fn tfa_kept(
+    error: &str,
+    detail: String,
+    sent_to: Option<String>,
+    other_phones: Vec<OtherPhone>,
+) -> Response {
+    let body = json!({
+        "error": error,
+        "detail": detail,
+        "state": "awaiting_2fa",
+        "retryable": true,
+        "sent_to": sent_to,
+        "other_phones": other_phones,
+    });
+    (status_for(error), Json(body)).into_response()
 }
 
 /// 409 for a request that arrives at the wrong point in the flow.
@@ -1715,8 +1739,83 @@ mod tests {
             let (s1, b1) = req(&st, "POST", &format!("/sessions/{id}/sms"), &format!(r#"{{"phone_id":{phone_id}}}"#)).await;
             assert_eq!(s1, StatusCode::BAD_REQUEST, "{phone_id}: {b1}");
             assert_eq!(b1["error"], "unknown_phone");
+            // The session is kept, and the body says so the way every other
+            // kept-session error does; without it a client drops the attempt.
+            assert_eq!(b1["retryable"], true, "{phone_id}: {b1}");
+            assert_eq!(b1["state"], "awaiting_2fa");
+            assert_eq!(b1["other_phones"], json!([{"id": 2, "number": "+386 •• ••• ••34"}]));
         }
         let (s2, b2) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"121212"}"#).await;
+        assert_eq!(s2, StatusCode::OK, "{b2}");
+    }
+
+    /// The switch the scripted login finds in the channel while "Apple" is still
+    /// checking the code posted before it.
+    fn switch_posted_meanwhile(io: &ServerInteract) -> Result<(u32, TfaAnswer), std::sync::mpsc::RecvTimeoutError> {
+        tokio::task::block_in_place(|| io.tfa_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_switch_after_the_code_got_through_leaves_the_sign_in_alone() {
+        // The session shows awaiting_2fa until the login reaches the devices, so
+        // a switch can arrive after Apple accepted the code. Aborting then kills
+        // a sign-in that passed 2FA, and the devices `/2fa` hands back lead to 410.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let phones = two_phones();
+                assert_eq!(io.get_2fa_code(texted(&phones, 3, PhoneReason::AppleDefault)), code("121212"));
+                assert_eq!(switch_posted_meanwhile(&io), Ok((1, TfaAnswer::TextPhone(2))));
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+        let session = st.sessions.lock().await.get(&id.parse::<Uuid>().unwrap()).cloned().unwrap();
+        session.tfa_tx.send((1, TfaAnswer::Code("121212".into()))).unwrap();
+
+        let (s1, b1) = req(&st, "POST", &format!("/sessions/{id}/sms"), r#"{"phone_id":2}"#).await;
+        assert_eq!(s1, StatusCode::CONFLICT, "{b1}");
+        assert_eq!(b1["error"], "wrong_step");
+        let (s2, b2) = req(
+            &st, "POST", &format!("/sessions/{id}/escrow"),
+            r#"{"device_index":0,"passcode":"0000"}"#,
+        ).await;
+        assert_eq!(s2, StatusCode::OK, "the switch killed a sign-in that passed 2FA: {b2}");
+        assert_eq!(b2["state"], "done");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_switch_overtaken_by_a_refused_code_says_nothing_was_texted() {
+        // Apple refused the code posted just before the switch, so the login
+        // asks for that text again and drops the switch as stale. Answering it as
+        // the new text sends the user to wait for a text that never comes.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let phones = two_phones();
+                let first = texted(&phones, 3, PhoneReason::AppleDefault);
+                assert_eq!(io.get_2fa_code(first), code("111111"));
+                assert_eq!(switch_posted_meanwhile(&io), Ok((1, TfaAnswer::TextPhone(2))));
+                assert_eq!(io.get_2fa_code(TfaPrompt { refused: 1, ..first }), code("222222"));
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+        let session = st.sessions.lock().await.get(&id.parse::<Uuid>().unwrap()).cloned().unwrap();
+        session.tfa_tx.send((1, TfaAnswer::Code("111111".into()))).unwrap();
+
+        let (s1, b1) = req(&st, "POST", &format!("/sessions/{id}/sms"), r#"{"phone_id":2}"#).await;
+        assert_eq!(s1, StatusCode::UNAUTHORIZED, "{b1}");
+        assert_eq!(b1["error"], BAD_2FA_CODE);
+        assert_eq!(b1["retryable"], true);
+        assert_eq!(b1["sent_to"], "+1 (•••) •••-••12", "reported a text that was never sent");
+        let (s2, b2) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"222222"}"#).await;
         assert_eq!(s2, StatusCode::OK, "{b2}");
     }
 
