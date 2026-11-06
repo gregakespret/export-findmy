@@ -86,8 +86,9 @@ logged.
 
 | Method & path | Body | Response |
 |---|---|---|
-| `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa","sent_to"}` (`sent_to`: Apple's masked number of the phone the code was texted to, e.g. `"+1 (•••) •••-••12"`, or `null`) — or `"awaiting_passcode"` + `devices` if Apple already trusts the session and skips 2FA |
-| `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":[{"serial","name","model"},…]}` — or `401 {"error":"bad_2fa_code","retryable":true,"state":"awaiting_2fa","sent_to",…}` when Apple refused the code and will take another for the same text (see below) |
+| `POST /sessions` | `{"apple_id","password"}` | `201 {"session_id","state":"awaiting_2fa","sent_to","other_phones"}` (`sent_to`: Apple's masked number of the phone the code was texted to, e.g. `"+1 (•••) •••-••12"`, or `null`; `other_phones`: the account's other trusted phones, `[{"id","number"}]` with masked numbers, see below) — or `"awaiting_passcode"` + `devices` if Apple already trusts the session and skips 2FA |
+| `POST /sessions/{id}/2fa` | `{"code"}` | `200 {"state":"awaiting_passcode","devices":[{"serial","name","model"},…]}` — or `401 {"error":"bad_2fa_code","retryable":true,"state":"awaiting_2fa","sent_to","other_phones",…}` when Apple refused the code and will take another for the same text (see below) |
+| `POST /sessions/{id}/sms` | `{"phone_id"}` | `200 {"state":"awaiting_2fa","sent_to","other_phones"}`: the code was texted to that phone (one of `other_phones`) instead, so post its code to `/2fa` (see below) |
 | `POST /sessions/{id}/escrow` | `{"device_index","passcode"}` | `200 {"state":"done","beacons":[…]}` |
 | `GET /healthz` | — | `200 {"status":"ok"}` |
 
@@ -162,7 +163,7 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (a wrong password *or* a wrong 2FA code — Apple judged what was typed and
-rejected it), `bad_2fa_code`, `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
+rejected it), `bad_2fa_code`, `unknown_phone`, `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
 `no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
 `sms_refused`, `anisette_unavailable`, `extractor_panic`, `apple_error`.
 
@@ -190,6 +191,21 @@ working. Nothing new is sent for a retype. A text gets three codes; the third
 refusal, or a refusal Apple marks as final, comes back as `bad_credentials` and
 retires the session. All of one text's codes share the 600s wait the first ask
 opened.
+
+The code goes to Apple's own default trusted phone, the one the account holder
+picked; without one, to phone id 1, the account's oldest number. When that is not
+the user's phone, `POST /sessions/{id}/sms` with one of `other_phones` texts that
+phone instead. It is a new text, with its own three codes and 600s, and its code
+is the one to post. A `phone_id` not in
+`other_phones` is `unknown_phone` (HTTP 400) and leaves the session as it was.
+If Apple will not send the new text (`sms_refused`), the attempt ends. Each
+phone choice logs one line:
+
+    [sess=…] SMS_PHONE phones=[2:34,3:12] apple_default=3 texted=3 reason=apple_default
+
+with each phone as id and last two digits, and `reason` one of `apple_default`,
+`id_1`, `first_listed`, `lookup_failed` (the phones could not be read; id 1
+blind), `apple_sent` (Apple texted the code itself) or `user_switch`.
 
 `signin_refused` (HTTP 502) is Apple turning the sign-in itself away with
 -80045 "This action cannot be completed at this time." It can arrive before

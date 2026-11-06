@@ -15,15 +15,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
-use icloud_auth::TfaPrompt;
+use icloud_auth::{PhoneReason, TfaAnswer, TfaPrompt};
 
 use crate::anisette::AnisetteServer;
-use crate::pipeline::{run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError};
+use crate::pipeline::{
+    other_phones, run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError,
+};
 
 const INPUT_TIMEOUT: Duration = Duration::from_secs(600); // pipeline waits on the user
 const SESSION_TTL: Duration = Duration::from_secs(600);
@@ -116,6 +118,9 @@ pub enum Step {
         ask: u32,
         /// Why the previous code failed, when this ask is a retype.
         retry: Option<RetryNotice>,
+        /// The account's other trusted phones, any of which `POST /sms` can
+        /// text instead when the user does not have the one in `sent_to`.
+        other_phones: Vec<OtherPhone>,
     },
     AwaitingEscrow {
         devices: Vec<DeviceInfo>,
@@ -142,6 +147,43 @@ pub struct RetryNotice {
     pub detail: String,
 }
 
+/// A trusted phone the code was not texted to. `number` is Apple's masked form
+/// (e.g. "+1 (•••) •••-••34"); the full number never leaves Apple.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct OtherPhone {
+    pub id: u32,
+    pub number: String,
+}
+
+/// The wire name of why the code went to the phone it did, as `SMS_PHONE` logs it.
+fn reason_name(reason: PhoneReason) -> &'static str {
+    match reason {
+        PhoneReason::AppleDefault => "apple_default",
+        PhoneReason::IdOne => "id_1",
+        PhoneReason::FirstListed => "first_listed",
+        PhoneReason::LookupFailed => "lookup_failed",
+        PhoneReason::AppleSent => "apple_sent",
+        PhoneReason::UserSwitch => "user_switch",
+    }
+}
+
+/// The `SMS_PHONE` record of which phone a new text went to and why: each phone
+/// as id:last-two-digits, Apple's default, the texted id, the reason. The
+/// library's own lines about this are info-level, which production's filter
+/// drops, so without this a code sent to the wrong person cannot be told from
+/// a user who never looked.
+fn sms_phone_line(prompt: &TfaPrompt<'_>) -> String {
+    let phones: Vec<String> = prompt.phones.iter().map(|p| format!("{}:{}", p.id, p.last_two_digits)).collect();
+    let or_none = |id: Option<u32>| id.map_or("none".to_string(), |id| id.to_string());
+    format!(
+        "SMS_PHONE phones=[{}] apple_default={} texted={} reason={}",
+        phones.join(","),
+        or_none(prompt.apple_default),
+        or_none(prompt.texted.map(|t| t.id)),
+        prompt.texted.map_or("none", |t| reason_name(t.reason)),
+    )
+}
+
 /// The code a retypable wrong 2FA code is reported under. Not `bad_credentials`,
 /// which still ends the attempt: this one means the session is waiting for the
 /// code from the same text again.
@@ -149,8 +191,9 @@ pub const BAD_2FA_CODE: &str = "bad_2fa_code";
 
 pub struct Session {
     pub step_rx: watch::Receiver<Step>,
-    /// Each code goes with the ask it was posted against (`Step::AwaitingTfa::ask`).
-    pub tfa_tx: Sender<(u32, String)>,
+    /// Each answer (a code, or a phone to text instead) goes with the ask it was
+    /// posted against (`Step::AwaitingTfa::ask`).
+    pub tfa_tx: Sender<(u32, TfaAnswer)>,
     pub escrow_tx: Sender<(usize, String)>,
     /// Cancels the *pipeline* task, not the wrapper that awaits it. Aborting the
     /// wrapper would only drop its future — and dropping a `JoinHandle` detaches
@@ -166,7 +209,7 @@ pub struct Session {
 pub struct ServerInteract {
     id: Uuid,
     step_tx: watch::Sender<Step>,
-    tfa_rx: StdMutex<Receiver<(u32, String)>>,
+    tfa_rx: StdMutex<Receiver<(u32, TfaAnswer)>>,
     escrow_rx: StdMutex<Receiver<(usize, String)>>,
     passcode: StdMutex<Option<String>>,
     /// Carries the last retryable join failure from `join_retryable` to the
@@ -182,7 +225,10 @@ pub struct ServerInteract {
 }
 
 impl Interact for ServerInteract {
-    fn get_2fa_code(&self, prompt: TfaPrompt<'_>) -> Option<String> {
+    fn get_2fa_code(&self, prompt: TfaPrompt<'_>) -> Option<TfaAnswer> {
+        if prompt.refused == 0 {
+            slog!(self.id, "{}", sms_phone_line(&prompt));
+        }
         // A retype answers the same text as the ask before it, so it shares that
         // ask's window instead of opening a new one. A session then waits on one
         // text no longer than it did before retypes existed, which is also as
@@ -216,26 +262,30 @@ impl Interact for ServerInteract {
                 .into(),
         });
         let _ = self.step_tx.send(Step::AwaitingTfa {
-            sent_to: prompt.sent_to.map(str::to_string),
+            sent_to: prompt.sent_to().map(str::to_string),
             ask,
             retry,
+            other_phones: other_phones(&prompt)
+                .map(|p| OtherPhone { id: p.id, number: p.number_with_dial_code.clone() })
+                .collect(),
         });
         let received = tokio::task::block_in_place(|| {
             let rx = self.tfa_rx.lock().unwrap();
             loop {
                 match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    // Posted against an earlier ask while that ask's code was
+                    // Posted against an earlier ask while that ask's answer was
                     // still with Apple (a double-submit). The user typed it
                     // before learning the last code was wrong, so it is not their
                     // retype, and sending it would spend one of the text's tries,
                     // and a step toward Apple's lock, on a code already refused.
+                    // A stale phone switch would text a phone a second time.
                     Ok((posted_against, _)) if posted_against < ask => continue,
                     other => return other,
                 }
             }
         });
         match received {
-            Ok((_, code)) => Some(code),
+            Ok((_, answer)) => Some(answer),
             Err(e) => {
                 // No code makes login fail as "bad credentials", so a user who
                 // never got round to typing the code is reported as if they had
@@ -414,6 +464,11 @@ struct TfaBody {
 }
 
 #[derive(Deserialize)]
+struct SmsBody {
+    phone_id: u32,
+}
+
+#[derive(Deserialize)]
 struct EscrowBody {
     device_index: usize,
     passcode: String,
@@ -473,10 +528,11 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
 /// `(keep_session, status, body)`. Pure, so the contract is unit-tested.
 fn start_outcome(id: Uuid, outcome: Option<Step>) -> (bool, StatusCode, serde_json::Value) {
     match outcome {
-        Some(Step::AwaitingTfa { sent_to, .. }) => (
+        Some(Step::AwaitingTfa { sent_to, other_phones, .. }) => (
             true,
             StatusCode::CREATED,
-            json!({"session_id": id, "state": "awaiting_2fa", "sent_to": sent_to}),
+            json!({"session_id": id, "state": "awaiting_2fa", "sent_to": sent_to,
+                   "other_phones": other_phones}),
         ),
         Some(Step::AwaitingEscrow { devices, .. }) => (
             true,
@@ -526,7 +582,7 @@ async fn submit_2fa(
         slog!(id, "POST /2fa rejected: session is at {}, not awaiting_2fa", current);
         return wrong_step();
     };
-    let _ = session.tfa_tx.send((posted_against, body.code));
+    let _ = session.tfa_tx.send((posted_against, TfaAnswer::Code(body.code)));
     let mut rx = session.step_rx.clone();
     // A refused code lands back on AwaitingTfa, where this post started, so the
     // ask count, not the shape, says the pipeline has moved on.
@@ -540,7 +596,9 @@ async fn submit_2fa(
         // the same text. The session stays alive: retiring it would make the
         // user sign in again, which texts a new code and strands the one they
         // have.
-        Some(Step::AwaitingTfa { sent_to, retry: Some(RetryNotice { error, detail }), .. }) => {
+        Some(Step::AwaitingTfa {
+            sent_to, other_phones, retry: Some(RetryNotice { error, detail }), ..
+        }) => {
             slog!(id, "POST /2fa -> {error}, retryable: session stays at awaiting_2fa");
             (
                 status_for(error),
@@ -550,6 +608,7 @@ async fn submit_2fa(
                     "state": "awaiting_2fa",
                     "retryable": true,
                     "sent_to": sent_to,
+                    "other_phones": other_phones,
                 })),
             )
                 .into_response()
@@ -587,6 +646,82 @@ async fn submit_2fa(
         }
         Some(other) => {
             slog!(id, "POST /2fa: left awaiting_2fa for {} — aborting the attempt",
+                  step_name(&other));
+            session.abort.abort();
+            retire(&st, id).await;
+            error_response("apple_error", "Timed out waiting for Apple.".into())
+        }
+    }
+}
+
+/// Text the code to another of the account's trusted phones, for a user who does
+/// not have the one it went to. The login sends the new text and asks for its
+/// code, which `POST /2fa` then answers as usual.
+async fn submit_sms(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SmsBody>,
+) -> Response {
+    let session = match touch(&st, id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    // One borrow, for the reason given in `submit_2fa`.
+    let (current, posted_against, listed) = {
+        let step = session.step_rx.borrow();
+        match &*step {
+            Step::AwaitingTfa { ask, other_phones, .. } => {
+                (step_name(&step), Some(*ask), other_phones.iter().any(|p| p.id == body.phone_id))
+            }
+            _ => (step_name(&step), None, false),
+        }
+    };
+    slog!(id, "POST /sms: phone id {}, session at {}", body.phone_id, current);
+    let Some(posted_against) = posted_against else {
+        slog!(id, "POST /sms rejected: session is at {}, not awaiting_2fa", current);
+        return wrong_step();
+    };
+    // Only a phone the client was offered: the login would pass any other id to
+    // Apple, spending one of the account's texts on a refusal.
+    if !listed {
+        slog!(id, "POST /sms rejected: phone id {} is not one of the other phones", body.phone_id);
+        return error_response(
+            "unknown_phone",
+            "That phone is not one of this Apple ID's other trusted phones.".into(),
+        );
+    }
+    let _ = session.tfa_tx.send((posted_against, TfaAnswer::TextPhone(body.phone_id)));
+    let mut rx = session.step_rx.clone();
+    let next = wait_for(&mut rx, START_TIMEOUT, |s| match s {
+        Step::AwaitingTfa { ask, .. } => *ask > posted_against,
+        _ => true,
+    })
+    .await;
+    match next {
+        Some(Step::AwaitingTfa { sent_to, other_phones, .. }) => {
+            slog!(id, "POST /sms -> awaiting_2fa for the new text");
+            (
+                StatusCode::OK,
+                Json(json!({"state": "awaiting_2fa", "sent_to": sent_to, "other_phones": other_phones})),
+            )
+                .into_response()
+        }
+        // Apple would not send the text (e.g. 423 `sms_refused`). The login has
+        // failed, so the code already texted can no longer be posted either.
+        Some(Step::Failed { error, detail }) => {
+            slog!(id, "POST /sms -> failed: code={error} detail={detail:?}");
+            retire(&st, id).await;
+            error_response(error, detail)
+        }
+        None => {
+            slog!(id, "POST /sms: no answer from Apple within {}s — aborting the attempt",
+                  START_TIMEOUT.as_secs());
+            session.abort.abort();
+            retire(&st, id).await;
+            error_response("apple_error", "Timed out waiting for Apple.".into())
+        }
+        Some(other) => {
+            slog!(id, "POST /sms: left awaiting_2fa for {} — aborting the attempt",
                   step_name(&other));
             session.abort.abort();
             retire(&st, id).await;
@@ -775,7 +910,9 @@ fn status_for(code: &str) -> StatusCode {
         // Apple refusing this account until its owner unlocks it: a 401 would
         // say "retype", and nothing the caller sends gets past the lock.
         "account_locked" => StatusCode::FORBIDDEN,
-        "bad_passcode" | "bad_device_index" | "no_bottles" => StatusCode::BAD_REQUEST,
+        "bad_passcode" | "bad_device_index" | "no_bottles" | "unknown_phone" => {
+            StatusCode::BAD_REQUEST
+        }
         // Not a malformed request: the passcode was right and the input was
         // valid. What conflicts is the state of the account's keychain trust
         // circle, which no correction to this request can fix.
@@ -795,6 +932,7 @@ fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/sessions", post(create_session))
         .route("/sessions/:id/2fa", post(submit_2fa))
+        .route("/sessions/:id/sms", post(submit_sms))
         .route("/sessions/:id/escrow", post(submit_escrow))
         .with_state(state)
 }
@@ -868,6 +1006,7 @@ pub async fn serve(port: u16, anisette: AnisetteServer) -> Result<(), Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use icloud_auth::{PhoneChoice, TrustedPhoneNumber};
     use tower::ServiceExt; // oneshot
 
     #[test]
@@ -888,6 +1027,8 @@ mod tests {
         assert_eq!(status_for("device_no_shares"), StatusCode::CONFLICT);
         assert_eq!(status_for("bad_device_index"), StatusCode::BAD_REQUEST);
         assert_eq!(status_for("no_bottles"), StatusCode::BAD_REQUEST);
+        // A phone the client was never offered: the client's to fix.
+        assert_eq!(status_for("unknown_phone"), StatusCode::BAD_REQUEST);
         assert_eq!(status_for("session_not_found"), StatusCode::NOT_FOUND);
         assert_eq!(status_for("session_expired"), StatusCode::GONE);
         // Anything unrecognised is upstream's fault, not the caller's.
@@ -977,10 +1118,29 @@ mod tests {
     }
 
     /// The login's first ask for a code: nothing refused yet.
-    const FIRST_ASK: TfaPrompt<'static> = TfaPrompt { sent_to: None, refused: 0 };
+    const FIRST_ASK: TfaPrompt<'static> =
+        TfaPrompt { refused: 0, phones: &[], texted: None, apple_default: None };
 
     fn awaiting_tfa(sent_to: Option<String>) -> Step {
-        Step::AwaitingTfa { sent_to, ask: 1, retry: None }
+        Step::AwaitingTfa { sent_to, ask: 1, retry: None, other_phones: vec![] }
+    }
+
+    fn code(c: &str) -> Option<TfaAnswer> {
+        Some(TfaAnswer::Code(c.into()))
+    }
+
+    /// An account with two trusted phones, in the shape `GET /auth` lists them.
+    fn two_phones() -> Vec<TrustedPhoneNumber> {
+        serde_json::from_value(json!([
+            {"numberWithDialCode": "+386 •• ••• ••34", "lastTwoDigits": "34", "pushMode": "sms", "id": 2},
+            {"numberWithDialCode": "+1 (•••) •••-••12", "lastTwoDigits": "12", "pushMode": "sms", "id": 3},
+        ]))
+        .unwrap()
+    }
+
+    /// The prompt for a new text to phone `texted` of `phones`.
+    fn texted<'a>(phones: &'a [TrustedPhoneNumber], id: u32, reason: PhoneReason) -> TfaPrompt<'a> {
+        TfaPrompt { refused: 0, phones, texted: Some(PhoneChoice { id, reason }), apple_default: Some(3) }
     }
 
     fn test_device(serial: &str) -> DeviceInfo {
@@ -1137,8 +1297,8 @@ mod tests {
         // step-machine wiring is tested without touching Apple.
         let id = Uuid::new_v4();
         let session = spawn_session_with(id, |io| async move {
-            let code = io.get_2fa_code(FIRST_ASK);
-            assert_eq!(code.as_deref(), Some("123456"));
+            let answer = io.get_2fa_code(FIRST_ASK);
+            assert_eq!(answer, code("123456"));
             let idx = io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
             assert_eq!(idx, 1);
             let pass = io.get_passcode()?;
@@ -1148,7 +1308,7 @@ mod tests {
 
         // AwaitingTfa -> feed code -> AwaitingEscrow.
         let mut rx = session.step_rx.clone();
-        session.tfa_tx.send((1, "123456".into())).unwrap();
+        session.tfa_tx.send((1, TfaAnswer::Code("123456".into()))).unwrap();
         let step = wait_for(&mut rx, Duration::from_secs(5), |s| {
             matches!(s, Step::AwaitingEscrow { .. })
         })
@@ -1195,7 +1355,7 @@ mod tests {
             }])
         });
         let mut rx = session.step_rx.clone();
-        session.tfa_tx.send((1, "1".into())).unwrap();
+        session.tfa_tx.send((1, TfaAnswer::Code("1".into()))).unwrap();
         wait_for(&mut rx, Duration::from_secs(5), |s| matches!(s, Step::AwaitingEscrow { .. }))
             .await
             .unwrap();
@@ -1415,9 +1575,10 @@ mod tests {
         // code and the login asks again for the same text.
         let st = state_with(Arc::new(|id, _opts: ExportOpts| {
             spawn_session_with(id, |io| async move {
-                let sent_to = Some("+1 (•••) •••-••12");
-                assert_eq!(io.get_2fa_code(TfaPrompt { sent_to, refused: 0 }).as_deref(), Some("111111"));
-                assert_eq!(io.get_2fa_code(TfaPrompt { sent_to, refused: 1 }).as_deref(), Some("222222"));
+                let phones = two_phones();
+                let first = texted(&phones, 3, PhoneReason::AppleDefault);
+                assert_eq!(io.get_2fa_code(first), code("111111"));
+                assert_eq!(io.get_2fa_code(TfaPrompt { refused: 1, ..first }), code("222222"));
                 let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
                 let _ = io.get_passcode()?;
                 Ok(vec![sample_beacon()])
@@ -1434,6 +1595,8 @@ mod tests {
         assert_eq!(b1["state"], "awaiting_2fa");
         // Still the phone the one text went to: nothing new was sent.
         assert_eq!(b1["sent_to"], "+1 (•••) •••-••12");
+        // The retype screen can still offer the other phone.
+        assert_eq!(b1["other_phones"], json!([{"id": 2, "number": "+386 •• ••• ••34"}]));
         assert!(!st.sessions.lock().await.is_empty(), "a refused code retired the session");
 
         // The retype reaches the same login. Without the ask count this post
@@ -1450,18 +1613,18 @@ mod tests {
         // retype ask took it, one typo would spend two of the text's tries, and
         // count twice toward Apple locking the account.
         let session = spawn_session_with(Uuid::new_v4(), |io| async move {
-            assert_eq!(io.get_2fa_code(FIRST_ASK).as_deref(), Some("111111"));
-            let retype = io.get_2fa_code(TfaPrompt { sent_to: None, refused: 1 });
-            assert_eq!(retype.as_deref(), Some("222222"), "the retype took the stale copy");
+            assert_eq!(io.get_2fa_code(FIRST_ASK), code("111111"));
+            let retype = io.get_2fa_code(TfaPrompt { refused: 1, ..FIRST_ASK });
+            assert_eq!(retype, code("222222"), "the retype took the stale copy");
             Ok(vec![sample_beacon()])
         });
-        session.tfa_tx.send((1, "111111".into())).unwrap();
-        session.tfa_tx.send((1, "111111".into())).unwrap(); // the double-submit
+        session.tfa_tx.send((1, TfaAnswer::Code("111111".into()))).unwrap();
+        session.tfa_tx.send((1, TfaAnswer::Code("111111".into()))).unwrap(); // the double-submit
         let mut rx = session.step_rx.clone();
         wait_for(&mut rx, Duration::from_secs(5), |s| matches!(s, Step::AwaitingTfa { ask: 2, .. }))
             .await
             .expect("asked for the code again");
-        session.tfa_tx.send((2, "222222".into())).unwrap();
+        session.tfa_tx.send((2, TfaAnswer::Code("222222".into()))).unwrap();
         let step = wait_for(&mut rx, Duration::from_secs(5), |s| {
             matches!(s, Step::Done { .. } | Step::Failed { .. })
         })
@@ -1479,7 +1642,7 @@ mod tests {
             spawn_session_with(id, |io| async move {
                 io.get_2fa_code(FIRST_ASK);
                 *io.tfa_deadline.lock().unwrap() = Some(Instant::now()); // Apple was slow
-                match io.get_2fa_code(TfaPrompt { sent_to: None, refused: 1 }) {
+                match io.get_2fa_code(TfaPrompt { refused: 1, ..FIRST_ASK }) {
                     None => Err(PipelineError::BadCredentials("Bad 2fa code.".into())),
                     Some(_) => unreachable!("asked for a retype after the window"),
                 }
@@ -1493,6 +1656,87 @@ mod tests {
         assert_eq!(b1["error"], "bad_credentials", "{b1}");
         assert!(b1.get("retryable").is_none(), "{b1}");
         assert!(st.sessions.lock().await.is_empty(), "the failed attempt was kept");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_without_the_texted_phone_can_have_another_one_texted() {
+        // The bug this exists for: the code went to a phone its owner did not
+        // have (user 298's went to her husband's), and the only way out was a
+        // new sign-in that texted the same phone again.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let phones = two_phones();
+                let first = texted(&phones, 3, PhoneReason::AppleDefault);
+                assert_eq!(io.get_2fa_code(first), Some(TfaAnswer::TextPhone(2)));
+                // The login texted phone 2: a new text, so a new window and tries.
+                assert_eq!(io.get_2fa_code(texted(&phones, 2, PhoneReason::UserSwitch)), code("343434"));
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        assert_eq!(b["sent_to"], "+1 (•••) •••-••12");
+        // Masked numbers only, and never the phone already texted.
+        assert_eq!(b["other_phones"], json!([{"id": 2, "number": "+386 •• ••• ••34"}]));
+        let id = b["session_id"].as_str().unwrap().to_string();
+
+        let (s1, b1) = req(&st, "POST", &format!("/sessions/{id}/sms"), r#"{"phone_id":2}"#).await;
+        assert_eq!(s1, StatusCode::OK, "{b1}");
+        assert_eq!(b1["state"], "awaiting_2fa");
+        assert_eq!(b1["sent_to"], "+386 •• ••• ••34");
+        // The first phone is now the other one, so the user can switch back.
+        assert_eq!(b1["other_phones"], json!([{"id": 3, "number": "+1 (•••) •••-••12"}]));
+
+        let (s2, b2) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"343434"}"#).await;
+        assert_eq!(s2, StatusCode::OK, "the new text's code never reached the login: {b2}");
+        assert_eq!(b2["state"], "awaiting_passcode");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_phone_that_was_not_offered_is_refused_before_the_login_sees_it() {
+        // The login would pass any id to Apple, which spends one of the
+        // account's texts on a refusal; the session must stay usable.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let phones = two_phones();
+                assert_eq!(io.get_2fa_code(texted(&phones, 3, PhoneReason::AppleDefault)), code("121212"));
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+        // Phone 3 is the one already texted; 9 is not the account's at all.
+        for phone_id in [3, 9] {
+            let (s1, b1) = req(&st, "POST", &format!("/sessions/{id}/sms"), &format!(r#"{{"phone_id":{phone_id}}}"#)).await;
+            assert_eq!(s1, StatusCode::BAD_REQUEST, "{phone_id}: {b1}");
+            assert_eq!(b1["error"], "unknown_phone");
+        }
+        let (s2, b2) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"121212"}"#).await;
+        assert_eq!(s2, StatusCode::OK, "{b2}");
+    }
+
+    #[test]
+    fn sms_phone_line_records_the_choice_without_the_numbers() {
+        // Which phone a code went to, and why, is what tells "texted the wrong
+        // person" from "never looked". Last two digits only, as Apple shows them.
+        let phones = two_phones();
+        assert_eq!(
+            sms_phone_line(&texted(&phones, 3, PhoneReason::AppleDefault)),
+            "SMS_PHONE phones=[2:34,3:12] apple_default=3 texted=3 reason=apple_default"
+        );
+        let blind = TfaPrompt {
+            texted: Some(PhoneChoice { id: 1, reason: PhoneReason::LookupFailed }),
+            ..FIRST_ASK
+        };
+        assert_eq!(
+            sms_phone_line(&blind),
+            "SMS_PHONE phones=[] apple_default=none texted=1 reason=lookup_failed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
