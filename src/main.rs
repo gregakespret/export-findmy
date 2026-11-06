@@ -150,14 +150,21 @@ fn beacon_to_plist(b: &BeaconExport) -> plist::Value {
 struct CliInteract;
 
 impl Interact for CliInteract {
-    fn get_2fa_code(&self, sent_to: Option<&str>) -> String {
-        match sent_to {
+    fn get_2fa_code(&self, prompt: icloud_auth::TfaPrompt<'_>) -> Option<String> {
+        if prompt.refused > 0 {
+            eprintln!("Apple says that code is wrong. Type the code from the same text again.");
+        }
+        match prompt.sent_to {
             Some(phone) => eprint!("2FA code (texted to {phone}): "),
             None => eprint!("2FA code: "),
         }
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
-        input.trim().to_string()
+        // Closed stdin or a bare Enter is no code. Posted as "", Apple refuses
+        // it as a retypable wrong code, so EOF would loop through every try,
+        // each one a step toward Apple locking the account.
+        let code = input.trim();
+        (!code.is_empty()).then(|| code.to_string())
     }
 
     fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError> {

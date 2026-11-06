@@ -20,6 +20,8 @@ use serde_json::json;
 use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
+use icloud_auth::TfaPrompt;
+
 use crate::anisette::AnisetteServer;
 use crate::pipeline::{run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError};
 
@@ -52,11 +54,13 @@ macro_rules! slog {
 /// Why an input the pipeline was parked on never arrived. The two cases look
 /// the same to the user (the attempt dies) but mean opposite things to us: a
 /// timeout is a user who wandered off, a disconnect is the session being torn
-/// down under them — by the reaper, an abort, or a restart.
-fn why_no_input(e: std::sync::mpsc::RecvTimeoutError) -> String {
+/// down under them — by the reaper, an abort, or a restart. `waited` is how long
+/// this ask actually waited: a 2FA retype gets only what is left of its text's
+/// window, so `INPUT_TIMEOUT` would state a wait that never elapsed.
+fn why_no_input(e: std::sync::mpsc::RecvTimeoutError, waited: Duration) -> String {
     match e {
         std::sync::mpsc::RecvTimeoutError::Timeout => {
-            format!("nothing submitted within {}s", INPUT_TIMEOUT.as_secs())
+            format!("nothing submitted within {}s", waited.as_secs())
         }
         std::sync::mpsc::RecvTimeoutError::Disconnected => {
             "the session was torn down while waiting".to_string()
@@ -107,6 +111,11 @@ pub enum Step {
         /// Apple's masked number of the phone the code was texted to, passed
         /// on so the client can say which phone to check.
         sent_to: Option<String>,
+        /// Which ask this is, counting from 1. A refused code returns to this
+        /// same state; see `AwaitingEscrow::ask` for why the count is needed.
+        ask: u32,
+        /// Why the previous code failed, when this ask is a retype.
+        retry: Option<RetryNotice>,
     },
     AwaitingEscrow {
         devices: Vec<DeviceInfo>,
@@ -126,16 +135,22 @@ pub enum Step {
     Failed { error: &'static str, detail: String },
 }
 
-/// Why the pipeline came back to ask for another device.
+/// Why the pipeline came back to ask for another device, or for the code again.
 #[derive(Clone, Debug)]
 pub struct RetryNotice {
     pub error: &'static str,
     pub detail: String,
 }
 
+/// The code a retypable wrong 2FA code is reported under. Not `bad_credentials`,
+/// which still ends the attempt: this one means the session is waiting for the
+/// code from the same text again.
+pub const BAD_2FA_CODE: &str = "bad_2fa_code";
+
 pub struct Session {
     pub step_rx: watch::Receiver<Step>,
-    pub tfa_tx: Sender<String>,
+    /// Each code goes with the ask it was posted against (`Step::AwaitingTfa::ask`).
+    pub tfa_tx: Sender<(u32, String)>,
     pub escrow_tx: Sender<(usize, String)>,
     /// Cancels the *pipeline* task, not the wrapper that awaits it. Aborting the
     /// wrapper would only drop its future — and dropping a `JoinHandle` detaches
@@ -151,7 +166,7 @@ pub struct Session {
 pub struct ServerInteract {
     id: Uuid,
     step_tx: watch::Sender<Step>,
-    tfa_rx: StdMutex<Receiver<String>>,
+    tfa_rx: StdMutex<Receiver<(u32, String)>>,
     escrow_rx: StdMutex<Receiver<(usize, String)>>,
     passcode: StdMutex<Option<String>>,
     /// Carries the last retryable join failure from `join_retryable` to the
@@ -160,22 +175,74 @@ pub struct ServerInteract {
     retry: StdMutex<Option<RetryNotice>>,
     /// How many times we have asked for a device. See `Step::AwaitingEscrow`.
     asks: StdMutex<u32>,
+    /// How many times we have asked for a 2FA code. See `Step::AwaitingTfa`.
+    tfa_asks: StdMutex<u32>,
+    /// When the wait for the current text's code runs out.
+    tfa_deadline: StdMutex<Option<Instant>>,
 }
 
 impl Interact for ServerInteract {
-    fn get_2fa_code(&self, sent_to: Option<&str>) -> String {
-        let _ = self.step_tx.send(Step::AwaitingTfa { sent_to: sent_to.map(str::to_string) });
-        match tokio::task::block_in_place(|| {
-            self.tfa_rx.lock().unwrap().recv_timeout(INPUT_TIMEOUT)
-        }) {
-            Ok(code) => code,
+    fn get_2fa_code(&self, prompt: TfaPrompt<'_>) -> Option<String> {
+        // A retype answers the same text as the ask before it, so it shares that
+        // ask's window instead of opening a new one. A session then waits on one
+        // text no longer than it did before retypes existed, which is also as
+        // long as the caller keeps the attempt (airtag-tracker's ATTEMPT_TTL).
+        let deadline = {
+            let mut deadline = self.tfa_deadline.lock().unwrap();
+            match *deadline {
+                Some(d) if prompt.refused > 0 => d,
+                _ => *deadline.insert(Instant::now() + INPUT_TIMEOUT),
+            }
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        // Apple took the code's whole window to refuse it. Publishing the retype
+        // anyway would answer the waiting POST with "retryable", then fail the
+        // login a moment later with no handler left to report it, so the retyped
+        // code would meet a 409 "start over" instead of the real failure.
+        if wait.is_zero() {
+            slog!(self.id, "no 2FA code (the text's {}s ran out while Apple checked the \
+                   last one) — login will fail as bad credentials", INPUT_TIMEOUT.as_secs());
+            return None;
+        }
+        let ask = {
+            let mut asks = self.tfa_asks.lock().unwrap();
+            *asks += 1;
+            *asks
+        };
+        let retry = (prompt.refused > 0).then(|| RetryNotice {
+            error: BAD_2FA_CODE,
+            detail: "Apple says that verification code is wrong. Enter the code from the \
+                     same text message again."
+                .into(),
+        });
+        let _ = self.step_tx.send(Step::AwaitingTfa {
+            sent_to: prompt.sent_to.map(str::to_string),
+            ask,
+            retry,
+        });
+        let received = tokio::task::block_in_place(|| {
+            let rx = self.tfa_rx.lock().unwrap();
+            loop {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    // Posted against an earlier ask while that ask's code was
+                    // still with Apple (a double-submit). The user typed it
+                    // before learning the last code was wrong, so it is not their
+                    // retype, and sending it would spend one of the text's tries,
+                    // and a step toward Apple's lock, on a code already refused.
+                    Ok((posted_against, _)) if posted_against < ask => continue,
+                    other => return other,
+                }
+            }
+        });
+        match received {
+            Ok((_, code)) => Some(code),
             Err(e) => {
-                // An empty code makes login fail as "bad credentials", so a user
-                // who never got round to typing the code is reported as if they
-                // had mistyped their password. Only this line separates them.
+                // No code makes login fail as "bad credentials", so a user who
+                // never got round to typing the code is reported as if they had
+                // mistyped it. Only this line separates them.
                 slog!(self.id, "no 2FA code ({}) — login will fail as bad credentials",
-                      why_no_input(e));
-                String::new()
+                      why_no_input(e, wait));
+                None
             }
         }
     }
@@ -193,7 +260,8 @@ impl Interact for ServerInteract {
             self.escrow_rx.lock().unwrap().recv_timeout(INPUT_TIMEOUT)
         })
         .map_err(|e| {
-            slog!(self.id, "no device/passcode ({}) — abandoning the attempt", why_no_input(e));
+            slog!(self.id, "no device/passcode ({}) — abandoning the attempt",
+                  why_no_input(e, INPUT_TIMEOUT));
             PipelineError::Aborted
         })?;
         if idx >= devices.len() {
@@ -257,6 +325,8 @@ where
         passcode: StdMutex::new(None),
         retry: StdMutex::new(None),
         asks: StdMutex::new(0),
+        tfa_asks: StdMutex::new(0),
+        tfa_deadline: StdMutex::new(None),
     });
     let started = Instant::now();
     // Run the pipeline on its own task so a panic (e.g. an unwrap on unexpected
@@ -403,7 +473,7 @@ async fn create_session(State(st): State<AppState>, Json(body): Json<StartBody>)
 /// `(keep_session, status, body)`. Pure, so the contract is unit-tested.
 fn start_outcome(id: Uuid, outcome: Option<Step>) -> (bool, StatusCode, serde_json::Value) {
     match outcome {
-        Some(Step::AwaitingTfa { sent_to }) => (
+        Some(Step::AwaitingTfa { sent_to, .. }) => (
             true,
             StatusCode::CREATED,
             json!({"session_id": id, "state": "awaiting_2fa", "sent_to": sent_to}),
@@ -440,20 +510,61 @@ async fn submit_2fa(
     // pipeline can publish a transition in between and the rejection line names
     // a step that isn't the one that caused it ("at awaiting_2fa, not
     // awaiting_2fa") — a self-contradiction in the record meant to settle it.
-    let (current, ready) = {
+    // `posted_against` is the ask this request answers, as in `submit_escrow`.
+    let (current, posted_against) = {
         let step = session.step_rx.borrow();
-        (step_name(&step), matches!(&*step, Step::AwaitingTfa { .. }))
+        let ask = match &*step {
+            Step::AwaitingTfa { ask, .. } => Some(*ask),
+            _ => None,
+        };
+        (step_name(&step), ask)
     };
     // Never the code itself; its length is what tells an empty submit from a
     // mistyped one, and both reach Apple as the same rejection.
     slog!(id, "POST /2fa: code {} chars, session at {}", body.code.chars().count(), current);
-    if !ready {
+    let Some(posted_against) = posted_against else {
         slog!(id, "POST /2fa rejected: session is at {}, not awaiting_2fa", current);
         return wrong_step();
-    }
-    let _ = session.tfa_tx.send(body.code);
+    };
+    let _ = session.tfa_tx.send((posted_against, body.code));
     let mut rx = session.step_rx.clone();
-    match wait_for(&mut rx, START_TIMEOUT, |s| !matches!(s, Step::AwaitingTfa { .. })).await {
+    // A refused code lands back on AwaitingTfa, where this post started, so the
+    // ask count, not the shape, says the pipeline has moved on.
+    let next = wait_for(&mut rx, START_TIMEOUT, |s| match s {
+        Step::AwaitingTfa { ask, .. } => *ask > posted_against,
+        _ => true,
+    })
+    .await;
+    match next {
+        // Apple refused the code, and the login is waiting for another one for
+        // the same text. The session stays alive: retiring it would make the
+        // user sign in again, which texts a new code and strands the one they
+        // have.
+        Some(Step::AwaitingTfa { sent_to, retry: Some(RetryNotice { error, detail }), .. }) => {
+            slog!(id, "POST /2fa -> {error}, retryable: session stays at awaiting_2fa");
+            (
+                status_for(error),
+                Json(json!({
+                    "error": error,
+                    "detail": detail,
+                    "state": "awaiting_2fa",
+                    "retryable": true,
+                    "sent_to": sent_to,
+                })),
+            )
+                .into_response()
+        }
+        // A later ask with no retry is a code for a new text, not a retype of
+        // this one. The API has no answer for that, so the attempt still ends,
+        // but the generic arm below would log "left awaiting_2fa for
+        // awaiting_2fa", naming one step as both ends of the move.
+        Some(Step::AwaitingTfa { retry: None, .. }) => {
+            slog!(id, "POST /2fa: Apple asked for a code from a new text — aborting the \
+                   attempt");
+            session.abort.abort();
+            retire(&st, id).await;
+            error_response("apple_error", "Timed out waiting for Apple.".into())
+        }
         Some(Step::AwaitingEscrow { devices, .. }) => {
             slog!(id, "POST /2fa -> awaiting_passcode with {} device(s)", devices.len());
             (StatusCode::OK, Json(json!({"state": "awaiting_passcode", "devices": devices})))
@@ -660,7 +771,7 @@ fn beacon_json(b: &BeaconExport) -> serde_json::Value {
 
 fn status_for(code: &str) -> StatusCode {
     match code {
-        "bad_credentials" => StatusCode::UNAUTHORIZED,
+        "bad_credentials" | BAD_2FA_CODE => StatusCode::UNAUTHORIZED,
         // Apple refusing this account until its owner unlocks it: a 401 would
         // say "retype", and nothing the caller sends gets past the lock.
         "account_locked" => StatusCode::FORBIDDEN,
@@ -765,6 +876,8 @@ mod tests {
         // into each other — a 4xx that reads as "fix your input" is wrong for a
         // failure the user's input cannot fix.
         assert_eq!(status_for("bad_credentials"), StatusCode::UNAUTHORIZED);
+        // A wrong code the user can retype is theirs to fix, like a password.
+        assert_eq!(status_for(BAD_2FA_CODE), StatusCode::UNAUTHORIZED);
         // Apple refusing the sign-in is not the caller's to fix, so not the
         // 401 that `bad_credentials` gets.
         assert_eq!(status_for("signin_refused"), StatusCode::BAD_GATEWAY);
@@ -805,7 +918,7 @@ mod tests {
     fn spawn_normal() -> Spawner {
         Arc::new(|id, _opts| {
             spawn_session_with(id, |io| async move {
-                let _code = io.get_2fa_code(None); // parks until POST /2fa
+                let _code = io.get_2fa_code(FIRST_ASK); // parks until POST /2fa
                 let idx =
                     io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
                 assert!(idx < 2);
@@ -863,6 +976,13 @@ mod tests {
         (status, json)
     }
 
+    /// The login's first ask for a code: nothing refused yet.
+    const FIRST_ASK: TfaPrompt<'static> = TfaPrompt { sent_to: None, refused: 0 };
+
+    fn awaiting_tfa(sent_to: Option<String>) -> Step {
+        Step::AwaitingTfa { sent_to, ask: 1, retry: None }
+    }
+
     fn test_device(serial: &str) -> DeviceInfo {
         DeviceInfo { serial: serial.into(), name: format!("{serial}-name"), model: "TestModel".into() }
     }
@@ -899,8 +1019,8 @@ mod tests {
         // Both end the attempt identically for the user; only this distinction
         // says whether to look at them or at us.
         use std::sync::mpsc::RecvTimeoutError;
-        assert!(why_no_input(RecvTimeoutError::Timeout).contains("600s"));
-        assert!(why_no_input(RecvTimeoutError::Disconnected).contains("torn down"));
+        assert!(why_no_input(RecvTimeoutError::Timeout, INPUT_TIMEOUT).contains("600s"));
+        assert!(why_no_input(RecvTimeoutError::Disconnected, INPUT_TIMEOUT).contains("torn down"));
     }
 
     #[test]
@@ -909,7 +1029,7 @@ mod tests {
         // the client was told it was on — the API calls AwaitingEscrow
         // "awaiting_passcode", so the log must too.
         assert_eq!(step_name(&Step::Starting), "starting");
-        assert_eq!(step_name(&Step::AwaitingTfa { sent_to: None }), "awaiting_2fa");
+        assert_eq!(step_name(&awaiting_tfa(None)), "awaiting_2fa");
         assert_eq!(step_name(&Step::AwaitingEscrow { devices: vec![], ask: 1, retry: None }),
                    "awaiting_passcode");
         assert_eq!(step_name(&Step::Running), "running");
@@ -1017,8 +1137,8 @@ mod tests {
         // step-machine wiring is tested without touching Apple.
         let id = Uuid::new_v4();
         let session = spawn_session_with(id, |io| async move {
-            let code = io.get_2fa_code(None);
-            assert_eq!(code, "123456");
+            let code = io.get_2fa_code(FIRST_ASK);
+            assert_eq!(code.as_deref(), Some("123456"));
             let idx = io.choose_bottle(&[test_device("GYK3003QMY"), test_device("J9NQHW229W")])?;
             assert_eq!(idx, 1);
             let pass = io.get_passcode()?;
@@ -1028,7 +1148,7 @@ mod tests {
 
         // AwaitingTfa -> feed code -> AwaitingEscrow.
         let mut rx = session.step_rx.clone();
-        session.tfa_tx.send("123456".into()).unwrap();
+        session.tfa_tx.send((1, "123456".into())).unwrap();
         let step = wait_for(&mut rx, Duration::from_secs(5), |s| {
             matches!(s, Step::AwaitingEscrow { .. })
         })
@@ -1058,7 +1178,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bad_device_index_fails_the_session() {
         let session = spawn_session_with(Uuid::new_v4(), |io| async move {
-            io.get_2fa_code(None);
+            io.get_2fa_code(FIRST_ASK);
             let idx = io.choose_bottle(&[test_device("only")])?; // index 5 is out of range
             let _ = io.get_passcode()?;
             Ok(vec![BeaconExport {
@@ -1075,7 +1195,7 @@ mod tests {
             }])
         });
         let mut rx = session.step_rx.clone();
-        session.tfa_tx.send("1".into()).unwrap();
+        session.tfa_tx.send((1, "1".into())).unwrap();
         wait_for(&mut rx, Duration::from_secs(5), |s| matches!(s, Step::AwaitingEscrow { .. }))
             .await
             .unwrap();
@@ -1096,14 +1216,14 @@ mod tests {
         // Normal: 2FA required. The masked phone is passed through so the
         // client can tell the user which phone the code went to.
         let sent_to = Some("+1 (•••) •••-••12".to_string());
-        let (keep, status, body) = start_outcome(id, Some(Step::AwaitingTfa { sent_to }));
+        let (keep, status, body) = start_outcome(id, Some(awaiting_tfa(sent_to)));
         assert!(keep && status == StatusCode::CREATED);
         assert_eq!(body["state"], "awaiting_2fa");
         assert_eq!(body["sent_to"], "+1 (•••) •••-••12");
         assert!(body.get("devices").is_none());
 
         // Phone unknown: `null`, so the client falls back to generic wording.
-        let (_, _, body) = start_outcome(id, Some(Step::AwaitingTfa { sent_to: None }));
+        let (_, _, body) = start_outcome(id, Some(awaiting_tfa(None)));
         assert!(body["sent_to"].is_null());
 
         // 2FA skipped: device list returned directly so the client skips /2fa.
@@ -1285,6 +1405,94 @@ mod tests {
         ).await;
         assert_eq!(s2, StatusCode::OK, "second device never ran: {b2}");
         assert_eq!(b2["state"], "done");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_code_keeps_the_session_and_takes_the_code_again() {
+        // A wrong code used to retire the session, so the user had to sign in
+        // again, which texts a new code and makes the one they have stop
+        // working. The runner plays icloud-auth's loop: Apple refuses the first
+        // code and the login asks again for the same text.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let sent_to = Some("+1 (•••) •••-••12");
+                assert_eq!(io.get_2fa_code(TfaPrompt { sent_to, refused: 0 }).as_deref(), Some("111111"));
+                assert_eq!(io.get_2fa_code(TfaPrompt { sent_to, refused: 1 }).as_deref(), Some("222222"));
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+
+        let (s1, b1) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"111111"}"#).await;
+        assert_eq!(s1, StatusCode::UNAUTHORIZED);
+        assert_eq!(b1["error"], BAD_2FA_CODE);
+        assert_eq!(b1["retryable"], true);
+        assert_eq!(b1["state"], "awaiting_2fa");
+        // Still the phone the one text went to: nothing new was sent.
+        assert_eq!(b1["sent_to"], "+1 (•••) •••-••12");
+        assert!(!st.sessions.lock().await.is_empty(), "a refused code retired the session");
+
+        // The retype reaches the same login. Without the ask count this post
+        // would re-match the retry state it was made against and 401 forever.
+        let (s2, b2) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"222222"}"#).await;
+        assert_eq!(s2, StatusCode::OK, "the retyped code never reached the login: {b2}");
+        assert_eq!(b2["state"], "awaiting_passcode");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_double_submitted_code_is_not_taken_as_the_retype() {
+        // The second copy of a double-submitted POST /2fa arrives while the
+        // first is with Apple, so it is queued against the same ask. If the
+        // retype ask took it, one typo would spend two of the text's tries, and
+        // count twice toward Apple locking the account.
+        let session = spawn_session_with(Uuid::new_v4(), |io| async move {
+            assert_eq!(io.get_2fa_code(FIRST_ASK).as_deref(), Some("111111"));
+            let retype = io.get_2fa_code(TfaPrompt { sent_to: None, refused: 1 });
+            assert_eq!(retype.as_deref(), Some("222222"), "the retype took the stale copy");
+            Ok(vec![sample_beacon()])
+        });
+        session.tfa_tx.send((1, "111111".into())).unwrap();
+        session.tfa_tx.send((1, "111111".into())).unwrap(); // the double-submit
+        let mut rx = session.step_rx.clone();
+        wait_for(&mut rx, Duration::from_secs(5), |s| matches!(s, Step::AwaitingTfa { ask: 2, .. }))
+            .await
+            .expect("asked for the code again");
+        session.tfa_tx.send((2, "222222".into())).unwrap();
+        let step = wait_for(&mut rx, Duration::from_secs(5), |s| {
+            matches!(s, Step::Done { .. } | Step::Failed { .. })
+        })
+        .await
+        .expect("finished");
+        assert!(matches!(step, Step::Done { .. }), "{step:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_after_the_window_ends_the_attempt_instead_of_offering_a_retype() {
+        // Apple refused the code only once the text's window had run out. A
+        // "retryable" reply would send the user to retype into a login that is
+        // already failing, and the retype would meet a 409 "start over".
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                io.get_2fa_code(FIRST_ASK);
+                *io.tfa_deadline.lock().unwrap() = Some(Instant::now()); // Apple was slow
+                match io.get_2fa_code(TfaPrompt { sent_to: None, refused: 1 }) {
+                    None => Err(PipelineError::BadCredentials("Bad 2fa code.".into())),
+                    Some(_) => unreachable!("asked for a retype after the window"),
+                }
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+        let (s1, b1) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"111111"}"#).await;
+        assert_eq!(s1, StatusCode::UNAUTHORIZED);
+        assert_eq!(b1["error"], "bad_credentials", "{b1}");
+        assert!(b1.get("retryable").is_none(), "{b1}");
+        assert!(st.sessions.lock().await.is_empty(), "the failed attempt was kept");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
