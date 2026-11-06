@@ -160,7 +160,11 @@ impl Interact for CliInteract {
         }
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
-        Some(input.trim().to_string())
+        // Closed stdin or a bare Enter is no code. Posted as "", Apple refuses
+        // it as a retypable wrong code, so EOF would loop through every try,
+        // each one a step toward Apple locking the account.
+        let code = input.trim();
+        (!code.is_empty()).then(|| code.to_string())
     }
 
     fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError> {
