@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "steps": {
+    "build": {
+      "commands": [
+        "mkdir -p bin",
+        "cargo build --release --locked",
+        "cp target/release/export-findmy bin"
+      ]
+    }
+  }
+}
