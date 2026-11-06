@@ -14,7 +14,10 @@ use plist::Dictionary;
 use rustpush::{ActivationInfo, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 use anisette::AnisetteServer;
-use pipeline::{run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError};
+use icloud_auth::TfaAnswer;
+use pipeline::{
+    other_phones, run_export, BeaconExport, DeviceInfo, ExportOpts, Interact, PipelineError,
+};
 
 // ── Fake OSConfig (presents as iPhone to avoid NAS validation) ───────
 
@@ -150,21 +153,43 @@ fn beacon_to_plist(b: &BeaconExport) -> plist::Value {
 struct CliInteract;
 
 impl Interact for CliInteract {
-    fn get_2fa_code(&self, prompt: icloud_auth::TfaPrompt<'_>) -> Option<String> {
-        if prompt.refused > 0 {
+    fn get_2fa_code(&self, prompt: icloud_auth::TfaPrompt<'_>) -> Option<TfaAnswer> {
+        if let Some(refused) = prompt.switch_refused {
+            eprintln!("Phone {} was not texted: {} The code already texted still works.",
+                      refused.id, refused.reason);
+        } else if prompt.refused > 0 {
             eprintln!("Apple says that code is wrong. Type the code from the same text again.");
         }
-        match prompt.sent_to {
-            Some(phone) => eprint!("2FA code (texted to {phone}): "),
-            None => eprint!("2FA code: "),
+        let others: Vec<_> = other_phones(&prompt).collect();
+        for phone in &others {
+            eprintln!("Not your phone? Type \"text {}\" to text {} instead.",
+                      phone.id, phone.number_with_dial_code);
         }
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        // Closed stdin or a bare Enter is no code. Posted as "", Apple refuses
-        // it as a retypable wrong code, so EOF would loop through every try,
-        // each one a step toward Apple locking the account.
-        let code = input.trim();
-        (!code.is_empty()).then(|| code.to_string())
+        loop {
+            match prompt.sent_to() {
+                Some(phone) => eprint!("2FA code (texted to {phone}): "),
+                None => eprint!("2FA code: "),
+            }
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).unwrap();
+            // Closed stdin or a bare Enter is no code. Posted as "", Apple refuses
+            // it as a retypable wrong code, so EOF would loop through every try,
+            // each one a step toward Apple locking the account.
+            let input = input.trim();
+            if input.is_empty() {
+                return None;
+            }
+            // Any case, space or not: "Text 2" or "text2" posted as a code would
+            // spend one of the text's tries, and a step toward Apple's lock.
+            let switch = input.get(..4).filter(|w| w.eq_ignore_ascii_case("text"));
+            let Some(id) = switch.map(|_| input[4..].trim()) else {
+                return Some(TfaAnswer::Code(input.to_string()));
+            };
+            match id.parse() {
+                Ok(id) if others.iter().any(|p| p.id == id) => return Some(TfaAnswer::TextPhone(id)),
+                _ => eprintln!("{id:?} is not one of the phones above."),
+            }
+        }
     }
 
     fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError> {
