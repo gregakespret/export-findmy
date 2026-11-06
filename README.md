@@ -202,8 +202,10 @@ its body carries `retryable`, `state`, `sent_to` and `other_phones` like
 `bad_2fa_code`. A switch posted while a code is with Apple sends nothing: if
 Apple refuses that code, `/sms` answers with the same `bad_2fa_code` body as
 `/2fa`, and if the code got through, `wrong_step` (409) with the session kept.
-If Apple will not send the new text (`sms_refused`), the attempt ends. Each
-phone choice logs one line:
+If Apple will not send the new text (its send limit, say), the session stays on
+the text before, whose code still works: `/sms` answers `sms_refused` with the
+same kept-session body and a `detail` that says so. A sign-in can switch twice;
+after that `other_phones` is empty. Each new text logs one line:
 
     [sess=…] SMS_PHONE phones=[2:34,3:12] apple_default=3 texted=3 reason=apple_default
 

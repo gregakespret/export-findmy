@@ -189,6 +189,11 @@ fn sms_phone_line(prompt: &TfaPrompt<'_>) -> String {
 /// code from the same text again.
 pub const BAD_2FA_CODE: &str = "bad_2fa_code";
 
+/// A phone switch Apple would not text, reported with the session kept on the
+/// text before: the same code a refused first text ends the login with
+/// (`PipelineError::SmsRefused`), so a client reads both as Apple declining.
+const SMS_REFUSED: &str = "sms_refused";
+
 pub struct Session {
     pub step_rx: watch::Receiver<Step>,
     /// Each answer (a code, or a phone to text instead) goes with the ask it was
@@ -222,11 +227,21 @@ pub struct ServerInteract {
     tfa_asks: StdMutex<u32>,
     /// When the wait for the current text's code runs out.
     tfa_deadline: StdMutex<Option<Instant>>,
+    /// `TfaPrompt::texts` at the last ask, so a new text can be told from a
+    /// retype or a refused switch.
+    tfa_texts: StdMutex<u32>,
 }
 
 impl Interact for ServerInteract {
     fn get_2fa_code(&self, prompt: TfaPrompt<'_>) -> Option<TfaAnswer> {
-        if prompt.refused == 0 {
+        // A new text is one the login counts as sent since the last ask: not a
+        // retype, and not a switch Apple refused, both of which still wait on the
+        // text before.
+        let new_text = {
+            let mut texts = self.tfa_texts.lock().unwrap();
+            std::mem::replace(&mut *texts, prompt.texts) != prompt.texts
+        };
+        if new_text && prompt.texted.is_some() {
             slog!(self.id, "{}", sms_phone_line(&prompt));
         }
         // A retype answers the same text as the ask before it, so it shares that
@@ -236,7 +251,7 @@ impl Interact for ServerInteract {
         let deadline = {
             let mut deadline = self.tfa_deadline.lock().unwrap();
             match *deadline {
-                Some(d) if prompt.refused > 0 => d,
+                Some(d) if !new_text => d,
                 _ => *deadline.insert(Instant::now() + INPUT_TIMEOUT),
             }
         };
@@ -255,12 +270,23 @@ impl Interact for ServerInteract {
             *asks += 1;
             *asks
         };
-        let retry = (prompt.refused > 0).then(|| RetryNotice {
-            error: BAD_2FA_CODE,
-            detail: "Apple says that verification code is wrong. Enter the code from the \
-                     same text message again."
-                .into(),
-        });
+        let retry = if let Some(refused) = prompt.switch_refused {
+            // Nothing new was texted, so the code to type is still the first
+            // text's; say so, or the user waits for a text that is not coming.
+            let to = prompt.sent_to().map_or(String::new(), |phone| format!(" to {phone}"));
+            Some(RetryNotice {
+                error: SMS_REFUSED,
+                detail: format!("{}. The code already texted{to} still works.",
+                                refused.reason.trim_end_matches('.')),
+            })
+        } else {
+            (prompt.refused > 0).then(|| RetryNotice {
+                error: BAD_2FA_CODE,
+                detail: "Apple says that verification code is wrong. Enter the code from the \
+                         same text message again."
+                    .into(),
+            })
+        };
         let _ = self.step_tx.send(Step::AwaitingTfa {
             sent_to: prompt.sent_to().map(str::to_string),
             ask,
@@ -377,6 +403,7 @@ where
         asks: StdMutex::new(0),
         tfa_asks: StdMutex::new(0),
         tfa_deadline: StdMutex::new(None),
+        tfa_texts: StdMutex::new(0),
     });
     let started = Instant::now();
     // Run the pipeline on its own task so a panic (e.g. an unwrap on unexpected
@@ -690,14 +717,15 @@ async fn submit_sms(
     })
     .await;
     match next {
-        // The retype of the text already sent, not a new text: a code posted to
-        // `/2fa` reached Apple first, Apple refused it, and the login dropped
-        // this switch as stale. Nothing was texted, so answering with the new
-        // text's 200 would send the user to wait for a text that never comes.
+        // Still the text already sent, not a new one: Apple would not text that
+        // phone (`sms_refused`, e.g. its send limit), or a code posted to `/2fa`
+        // reached Apple first, was refused, and the login dropped this switch as
+        // stale (`bad_2fa_code`). Nothing was texted, so the new text's 200
+        // would send the user to wait for a text that never comes.
         Some(Step::AwaitingTfa {
             sent_to, other_phones, retry: Some(RetryNotice { error, detail }), ..
         }) => {
-            slog!(id, "POST /sms -> {error}: a code was checked first, so nothing was texted");
+            slog!(id, "POST /sms -> {error}: nothing texted, session stays on the text before");
             tfa_kept(error, detail, sent_to, other_phones)
         }
         Some(Step::AwaitingTfa { sent_to, other_phones, .. }) => {
@@ -708,8 +736,8 @@ async fn submit_sms(
             )
                 .into_response()
         }
-        // Apple would not send the text (e.g. 423 `sms_refused`). The login has
-        // failed, so the code already texted can no longer be posted either.
+        // The send failed some other way than Apple refusing it (e.g. Apple
+        // unreachable), which the login does not recover from.
         Some(Step::Failed { error, detail }) => {
             slog!(id, "POST /sms -> failed: code={error} detail={detail:?}");
             retire(&st, id).await;
@@ -1030,7 +1058,7 @@ pub async fn serve(port: u16, anisette: AnisetteServer) -> Result<(), Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icloud_auth::{PhoneChoice, TrustedPhoneNumber};
+    use icloud_auth::{PhoneChoice, SwitchRefused, TrustedPhoneNumber};
     use tower::ServiceExt; // oneshot
 
     #[test]
@@ -1142,8 +1170,9 @@ mod tests {
     }
 
     /// The login's first ask for a code: nothing refused yet.
-    const FIRST_ASK: TfaPrompt<'static> =
-        TfaPrompt { refused: 0, phones: &[], texted: None, apple_default: None };
+    const FIRST_ASK: TfaPrompt<'static> = TfaPrompt {
+        refused: 0, phones: &[], texted: None, apple_default: None, texts: 1, switch_refused: None,
+    };
 
     fn awaiting_tfa(sent_to: Option<String>) -> Step {
         Step::AwaitingTfa { sent_to, ask: 1, retry: None, other_phones: vec![] }
@@ -1162,9 +1191,17 @@ mod tests {
         .unwrap()
     }
 
-    /// The prompt for a new text to phone `texted` of `phones`.
+    /// The prompt for a new text to phone `texted` of `phones`: the sign-in's
+    /// first text, or its second after a `UserSwitch`.
     fn texted<'a>(phones: &'a [TrustedPhoneNumber], id: u32, reason: PhoneReason) -> TfaPrompt<'a> {
-        TfaPrompt { refused: 0, phones, texted: Some(PhoneChoice { id, reason }), apple_default: Some(3) }
+        TfaPrompt {
+            refused: 0,
+            phones,
+            texted: Some(PhoneChoice { id, reason }),
+            apple_default: Some(3),
+            texts: if reason == PhoneReason::UserSwitch { 2 } else { 1 },
+            switch_refused: None,
+        }
     }
 
     fn test_device(serial: &str) -> DeviceInfo {
@@ -1817,6 +1854,44 @@ mod tests {
         assert_eq!(b1["sent_to"], "+1 (•••) •••-••12", "reported a text that was never sent");
         let (s2, b2) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"222222"}"#).await;
         assert_eq!(s2, StatusCode::OK, "{b2}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_switch_apple_will_not_text_keeps_the_text_already_sent() {
+        // Apple's send limit refused the new text. Ending the sign-in would make
+        // the user start over, which costs yet another text, while the code
+        // already on the first phone still works. The runner plays the library:
+        // the same text, the same count of texts, and the refusal on the ask.
+        let st = state_with(Arc::new(|id, _opts: ExportOpts| {
+            spawn_session_with(id, |io| async move {
+                let phones = two_phones();
+                let first = texted(&phones, 3, PhoneReason::AppleDefault);
+                assert_eq!(io.get_2fa_code(first), Some(TfaAnswer::TextPhone(2)));
+                let refused = SwitchRefused { id: 2, reason: "Too many verification codes have been sent." };
+                let again = TfaPrompt { switch_refused: Some(refused), ..first };
+                assert_eq!(io.get_2fa_code(again), code("121212"));
+                let _ = io.choose_bottle(&[test_device("GYK3003QMY")])?;
+                let _ = io.get_passcode()?;
+                Ok(vec![sample_beacon()])
+            })
+        }));
+
+        let (_s, b) = req(&st, "POST", "/sessions", r#"{"apple_id":"me","password":"pw"}"#).await;
+        let id = b["session_id"].as_str().unwrap().to_string();
+        let (s1, b1) = req(&st, "POST", &format!("/sessions/{id}/sms"), r#"{"phone_id":2}"#).await;
+        assert_eq!(b1["error"], "sms_refused", "{b1}");
+        assert_eq!(s1, status_for("sms_refused"));
+        assert_eq!(b1["retryable"], true);
+        assert_eq!(b1["state"], "awaiting_2fa");
+        // Still the first phone, and the user is told its code still works.
+        assert_eq!(b1["sent_to"], "+1 (•••) •••-••12");
+        let detail = b1["detail"].as_str().unwrap();
+        assert!(detail.starts_with("Too many verification codes have been sent. "), "{detail}");
+        assert!(detail.contains("still works"), "{detail}");
+        assert!(!st.sessions.lock().await.is_empty(), "a refused switch retired the session");
+
+        let (s2, b2) = req(&st, "POST", &format!("/sessions/{id}/2fa"), r#"{"code":"121212"}"#).await;
+        assert_eq!(s2, StatusCode::OK, "the first text's code never reached the login: {b2}");
     }
 
     #[test]

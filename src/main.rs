@@ -154,7 +154,10 @@ struct CliInteract;
 
 impl Interact for CliInteract {
     fn get_2fa_code(&self, prompt: icloud_auth::TfaPrompt<'_>) -> Option<TfaAnswer> {
-        if prompt.refused > 0 {
+        if let Some(refused) = prompt.switch_refused {
+            eprintln!("Phone {} was not texted: {} The code already texted still works.",
+                      refused.id, refused.reason);
+        } else if prompt.refused > 0 {
             eprintln!("Apple says that code is wrong. Type the code from the same text again.");
         }
         let others: Vec<_> = other_phones(&prompt).collect();

@@ -461,11 +461,20 @@ const MAX_JOIN_ATTEMPTS: usize = 3;
 /// Apple can stop the retypes sooner (see `icloud_auth::TfaPrompt`).
 const MAX_CODE_TRIES: u32 = 3;
 
+/// How many times one sign-in may switch phones. Enough to reach every phone on
+/// a three-phone account. Not more: each switch is a text toward Apple's send
+/// limit (its 423, which then blocks a fresh sign-in too), and brings three
+/// fresh code tries toward its lock.
+const MAX_PHONE_SWITCHES: u32 = 2;
+
 /// The account's trusted phones other than the one the code went to: the ones a
-/// user who does not have that phone can ask to be texted instead.
+/// user who does not have that phone can ask to be texted instead. None once the
+/// sign-in has used its `MAX_PHONE_SWITCHES`.
 pub fn other_phones<'a>(prompt: &TfaPrompt<'a>) -> impl Iterator<Item = &'a TrustedPhoneNumber> {
     let texted = prompt.texted.map(|t| t.id);
-    prompt.phones.iter().filter(move |p| Some(p.id) != texted)
+    // `texts` counts the first text too, so the switches made are one fewer.
+    let can_switch = prompt.texts <= MAX_PHONE_SWITCHES;
+    prompt.phones.iter().filter(move |p| can_switch && Some(p.id) != texted)
 }
 
 /// The next 2FA answer for the login, or `None` once `MAX_CODE_TRIES` codes for
@@ -1046,7 +1055,9 @@ mod tests {
     #[test]
     fn a_text_gets_max_code_tries_codes_then_the_sign_in_fails() {
         let io = CodeAsks(std::sync::Mutex::new(0));
-        let prompt = |refused| TfaPrompt { refused, phones: &[], texted: None, apple_default: None };
+        let prompt = |refused| TfaPrompt {
+            refused, phones: &[], texted: None, apple_default: None, texts: 1, switch_refused: None,
+        };
         for refused in 0..MAX_CODE_TRIES {
             assert!(next_code(&io, prompt(refused)).is_some(), "{refused}");
         }
@@ -1064,9 +1075,29 @@ mod tests {
         ]))
         .unwrap();
         let texted = Some(icloud_auth::PhoneChoice { id: 3, reason: icloud_auth::PhoneReason::AppleDefault });
-        let prompt = TfaPrompt { refused: 0, phones: &phones, texted, apple_default: Some(3) };
+        let prompt = TfaPrompt {
+            refused: 0, phones: &phones, texted, apple_default: Some(3), texts: 1, switch_refused: None,
+        };
         let ids: Vec<u32> = other_phones(&prompt).map(|p| p.id).collect();
         assert_eq!(ids, [2]);
+    }
+
+    /// Each switch is a text toward Apple's send limit, which then blocks a
+    /// fresh sign-in too, so the offer stops after MAX_PHONE_SWITCHES.
+    #[test]
+    fn other_phones_stops_after_max_phone_switches() {
+        let phones: Vec<TrustedPhoneNumber> = serde_json::from_value(serde_json::json!([
+            {"numberWithDialCode": "+386 •• ••• ••34", "lastTwoDigits": "34", "pushMode": "sms", "id": 2},
+            {"numberWithDialCode": "+1 (•••) •••-••12", "lastTwoDigits": "12", "pushMode": "sms", "id": 3},
+        ]))
+        .unwrap();
+        let texted = Some(icloud_auth::PhoneChoice { id: 3, reason: icloud_auth::PhoneReason::UserSwitch });
+        let after = |texts| TfaPrompt {
+            refused: 0, phones: &phones, texted, apple_default: None, texts, switch_refused: None,
+        };
+        // The first text plus MAX_PHONE_SWITCHES - 1 switches: one more allowed.
+        assert_eq!(other_phones(&after(MAX_PHONE_SWITCHES)).count(), 1);
+        assert_eq!(other_phones(&after(MAX_PHONE_SWITCHES + 1)).count(), 0);
     }
 
     /// Only the sign-in identity changes: the service requests that follow keep
