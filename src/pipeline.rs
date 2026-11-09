@@ -23,6 +23,7 @@ use rustpush::findmy::{
     BeaconAccessory, BeaconNamingRecord, BeaconRatchet, KeyAlignmentRecord,
     MasterBeaconRecord, SharedBeaconRecord, FIND_MY_SERVICE, SEARCH_PARTY_CONTAINER,
 };
+use icloud_auth::{TfaAnswer, TfaPrompt, TrustedPhoneNumber};
 use rustpush::keychain::{KeychainClient, KeychainClientState};
 use rustpush::{
     login_apple_delegates, APSState, AppleAccount, DebugMutex, DebugRwLock, LoginDelegate,
@@ -124,6 +125,18 @@ pub enum PipelineError {
     DeviceNoShares(String),
     BadDeviceIndex(String),
     NoBottles,
+    /// Apple accepted the password, then refused to text the 2FA code: a 423 on
+    /// `PUT /auth/verify/phone`, its "This phone number cannot be used at this
+    /// time" and "Enter the last code you received or try again later". Kept
+    /// apart from `Apple` because nothing on either side is broken — the number
+    /// is under a send limit only time lifts, and an immediate retry is refused
+    /// the same way (production saw four in one minute) — so a client should
+    /// tell the user to wait, not page whoever runs it.
+    SmsRefused(String),
+    /// Our anisette provisioning host failed — see [`LOGIN_ANISETTE`]. Not
+    /// `Apple`: a client that reads `apple_error` as "Apple is refusing us"
+    /// looks for the outage in the wrong place.
+    AnisetteUnavailable,
     Apple(String),
     Aborted,
 }
@@ -140,6 +153,8 @@ impl PipelineError {
             PipelineError::DeviceNoShares(_) => "device_no_shares",
             PipelineError::BadDeviceIndex(_) => "bad_device_index",
             PipelineError::NoBottles => "no_bottles",
+            PipelineError::SmsRefused(_) => "sms_refused",
+            PipelineError::AnisetteUnavailable => "anisette_unavailable",
             PipelineError::Apple(_) => "apple_error",
             // Aborted is a local input timeout/cancellation, not an Apple fault —
             // the attempt lapsed, so report it as an expired session (410).
@@ -161,6 +176,8 @@ impl std::fmt::Display for PipelineError {
             PipelineError::NoBottles => {
                 write!(f, "No escrow bottles found. Make sure you have another trusted device.")
             }
+            PipelineError::SmsRefused(m) => write!(f, "{m}"),
+            PipelineError::AnisetteUnavailable => write!(f, "{LOGIN_ANISETTE}"),
             PipelineError::Apple(m) => write!(f, "{m}"),
             PipelineError::Aborted => write!(f, "The connection attempt was cancelled."),
         }
@@ -349,7 +366,11 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         // it properly means splitting the status check upstream in rustpush.
         // The trusted-device path is unaffected — `verify_2fa` goes through
         // `check_error`, so a wrong code there arrives as `AuthSrpWithMessage`.
-        E::AuthSrpWithMessage(..) | E::Bad2faCode => {
+        //
+        // `IncorrectCode` is the retypable kind of wrong code, which `login`
+        // answers by asking for the code again; it reaches here only from a
+        // direct `verify_sms_2fa` call, and means the same thing.
+        E::AuthSrpWithMessage(..) | E::Bad2faCode | E::IncorrectCode => {
             PipelineError::BadCredentials(format!("Apple sign-in failed: {e}"))
         }
         // The credentials are fine; the *account* is in a state that blocks
@@ -374,10 +395,24 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         // when the response carried one (a send limit, a blocked number), else
         // a fixed line naming the step; both beat `LOGIN_UPSTREAM`'s "wait a
         // minute", which sent users into a retry loop Apple kept refusing.
+        //
+        // Only a 423 is `sms_refused`: it is the status every refusal in the
+        // production logs carried, and the one that means "locked", not
+        // "broken". Any other status could be Apple's endpoint failing, so it
+        // stays `apple_error` and still alerts.
+        // The reason is shown in parentheses, not as a quote "Apple said":
+        // when the 423 body carries no message, rustpush substitutes its own
+        // fallback sentence, which Apple never wrote.
+        E::SmsSendFailed { status: 423, message } => PipelineError::SmsRefused(format!(
+            "Apple won't text a verification code to your phone right now \
+             ({message}). This is a limit on Apple's side, not a problem with \
+             your Apple ID or password, so trying again straight away won't \
+             help. Please wait a few hours, then try again."
+        )),
         E::SmsSendFailed { .. } => PipelineError::Apple(format!("Apple sign-in failed: {e}")),
         // Our own provisioning dependency, not Apple's service — see
         // `LOGIN_ANISETTE`.
-        E::ErrorGettingAnisette(_) => PipelineError::Apple(LOGIN_ANISETTE.to_string()),
+        E::ErrorGettingAnisette(_) => PipelineError::AnisetteUnavailable,
         // Transport or a response we could not parse — nothing about the
         // user's input. The variant and its payload are in the log line above;
         // the user gets a sentence they can act on instead.
@@ -392,12 +427,16 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
 
 /// Supplies the three inputs that arrive mid-login. Must be `Send + Sync` so the
 /// server can drive the pipeline from a spawned task (`&dyn Interact` is captured
-/// by the login closure). `get_2fa_code` returns `String` because rustpush's
-/// login closure is `Fn(Option<&str>) -> String`; an empty string makes login
-/// fail cleanly. `sent_to` is Apple's masked number of the phone the code was
-/// texted to (e.g. "+1 (•••) •••-••12"), `None` when rustpush could not tell.
+/// by the login closure). `get_2fa_code` is rustpush's login closure: the prompt
+/// carries the account's trusted phones, the one the code was texted to and why
+/// (`sent_to()` is its masked number, e.g. "+1 (•••) •••-••12", `None` when
+/// rustpush could not tell), and `refused`, how many codes Apple has refused for
+/// that text; above 0 the ask is a retype of the same text. The answer is the
+/// code, or `TfaAnswer::TextPhone` with one of `other_phones` to text that phone
+/// instead and be asked again. `None` (no answer arrived) fails the login
+/// without sending Apple anything.
 pub trait Interact: Send + Sync {
-    fn get_2fa_code(&self, sent_to: Option<&str>) -> String;
+    fn get_2fa_code(&self, prompt: TfaPrompt<'_>) -> Option<TfaAnswer>;
     fn choose_bottle(&self, devices: &[DeviceInfo]) -> Result<usize, PipelineError>;
     fn get_passcode(&self) -> Result<String, PipelineError>;
     /// A join failed in a way a *different* device can get past, and the
@@ -413,6 +452,40 @@ pub trait Interact: Send + Sync {
 /// recovery against Apple, and an unbounded loop would let a stuck client spend
 /// them all.
 const MAX_JOIN_ATTEMPTS: usize = 3;
+
+/// How many codes the user may type for one text before the sign-in is spent.
+/// Enough for a typo and then the stale-text mix-up (a code from an earlier
+/// attempt's text), which are the refusals production shows. Not more: each
+/// refused code counts toward Apple locking the account, and once the text is
+/// the problem a fresh sign-in, which sends a new one, is the way through.
+/// Apple can stop the retypes sooner (see `icloud_auth::TfaPrompt`).
+const MAX_CODE_TRIES: u32 = 3;
+
+/// How many times one sign-in may switch phones. Enough to reach every phone on
+/// a three-phone account. Not more: each switch is a text toward Apple's send
+/// limit (its 423, which then blocks a fresh sign-in too), and brings three
+/// fresh code tries toward its lock.
+const MAX_PHONE_SWITCHES: u32 = 2;
+
+/// The account's trusted phones other than the one the code went to: the ones a
+/// user who does not have that phone can ask to be texted instead. None once the
+/// sign-in has used its `MAX_PHONE_SWITCHES`.
+pub fn other_phones<'a>(prompt: &TfaPrompt<'a>) -> impl Iterator<Item = &'a TrustedPhoneNumber> {
+    let texted = prompt.texted.map(|t| t.id);
+    // `texts` counts the first text too, so the switches made are one fewer.
+    let can_switch = prompt.texts <= MAX_PHONE_SWITCHES;
+    prompt.phones.iter().filter(move |p| can_switch && Some(p.id) != texted)
+}
+
+/// The next 2FA answer for the login, or `None` once `MAX_CODE_TRIES` codes for
+/// this text have been refused, which fails the sign-in as a wrong code
+/// without asking the user for another.
+fn next_code(io: &dyn Interact, prompt: TfaPrompt<'_>) -> Option<TfaAnswer> {
+    if prompt.refused >= MAX_CODE_TRIES {
+        return None;
+    }
+    io.get_2fa_code(prompt)
+}
 
 pub struct ExportOpts {
     pub apple_id: String,
@@ -499,11 +572,18 @@ pub async fn run_export(
     )));
     if let AnisetteServer::Headers(_) = &opts.anisette {
         let identity = anisette_client.lock().await.get_headers().await
-            .map(|headers| headers["X-Mme-Client-Info"].clone())
+            .map_err(|e| format!("{e} [{e:?}]"))
+            // A host that answers without this header is as unusable as one
+            // that is down; indexing the map would panic the task instead.
+            .and_then(|headers| headers.get("X-Mme-Client-Info").cloned()
+                .ok_or_else(|| "headers host sent no X-Mme-Client-Info".to_string()))
             .map_err(|e| {
-                log!("!! FAILED at [1/7] anisette after {:.1}s: {} [{:?}]",
-                     started.elapsed().as_secs_f32(), e, e);
-                PipelineError::Apple(LOGIN_ANISETTE.to_string())
+                log!("!! FAILED at [1/7] anisette after {:.1}s: {}",
+                     started.elapsed().as_secs_f32(), e);
+                // The same host `login_error` reports as `anisette_unavailable`
+                // for `ErrorGettingAnisette`; this is its first contact, so an
+                // outage lands here, not there.
+                PipelineError::AnisetteUnavailable
             })?;
         // Device model and OS only: which identity Apple was shown.
         log!("  Signing in as anisette machine {}", identity);
@@ -515,7 +595,12 @@ pub async fn run_export(
     let apple_id_clone = opts.apple_id.clone();
     let password_hash: Vec<u8> = Sha256::digest(opts.password.as_bytes()).to_vec();
     let appleid_closure = move || (apple_id_clone.clone(), password_hash.clone());
-    let tfa_closure = |sent_to: Option<&str>| io.get_2fa_code(sent_to);
+    let tfa_closure = |prompt: TfaPrompt<'_>| {
+        if prompt.refused > 0 {
+            log!("   Apple refused code {}/{} for this text", prompt.refused, MAX_CODE_TRIES);
+        }
+        next_code(io, prompt)
+    };
 
     let account =
         AppleAccount::login(appleid_closure, tfa_closure, login_info, anisette_client.clone())
@@ -530,7 +615,7 @@ pub async fn run_export(
             })?;
 
     // These three were `expect`/`unwrap`: a panic unwinding out of the pipeline
-    // task, which the server can only report as "failed unexpectedly" with no
+    // task, which the server can only report as `extractor_panic` with no step
     // attribution. A login that returns no SPD is a real (if rare) Apple
     // response, so it gets a logged, attributable failure like any other.
     // `spd["DsPrsId"]` would be the same panic by another route — plist's
@@ -791,9 +876,9 @@ pub async fn run_export(
     // `.remove(0)` and the per-change field accesses below were unwraps on data
     // Apple controls — the least predictable input in the whole pipeline, and
     // the panic source `spawn_session_with` names when it explains why the
-    // pipeline runs on its own task. A panic here reaches the user as "The
-    // export failed unexpectedly." with no step attribution at all, which is
-    // the failure class this instrumentation exists to remove.
+    // pipeline runs on its own task. A panic here reaches the user as
+    // `extractor_panic` with no step attribution at all, which is the failure
+    // class this instrumentation exists to remove.
     let mut zones = result.map_err(|e| {
         step_failed!("[6/7] CloudKit fetch", PipelineError::Apple, "CloudKit fetch failed", e)
     })?;
@@ -948,6 +1033,73 @@ fn rfc3339_secs(t: SystemTime) -> String {
 mod tests {
     use super::*;
 
+    /// Counts how often the user was asked for a code.
+    struct CodeAsks(std::sync::Mutex<u32>);
+
+    impl Interact for CodeAsks {
+        fn get_2fa_code(&self, _prompt: TfaPrompt<'_>) -> Option<TfaAnswer> {
+            *self.0.lock().unwrap() += 1;
+            Some(TfaAnswer::Code("123456".into()))
+        }
+        fn choose_bottle(&self, _devices: &[DeviceInfo]) -> Result<usize, PipelineError> {
+            unreachable!()
+        }
+        fn get_passcode(&self) -> Result<String, PipelineError> {
+            unreachable!()
+        }
+    }
+
+    /// A wrong code is retyped into the same sign-in, but not without end:
+    /// every refused code counts toward Apple locking the account, so after
+    /// the last try the login fails without asking the user again.
+    #[test]
+    fn a_text_gets_max_code_tries_codes_then_the_sign_in_fails() {
+        let io = CodeAsks(std::sync::Mutex::new(0));
+        let prompt = |refused| TfaPrompt {
+            refused, phones: &[], texted: None, apple_default: None, texts: 1, switch_refused: None,
+        };
+        for refused in 0..MAX_CODE_TRIES {
+            assert!(next_code(&io, prompt(refused)).is_some(), "{refused}");
+        }
+        assert_eq!(next_code(&io, prompt(MAX_CODE_TRIES)), None);
+        assert_eq!(*io.0.lock().unwrap(), MAX_CODE_TRIES, "asked the user past the last try");
+    }
+
+    /// The phones a user can switch to are the account's others: offering the
+    /// one already texted would send a second code to the phone they lack.
+    #[test]
+    fn other_phones_leaves_out_the_texted_one() {
+        let phones: Vec<TrustedPhoneNumber> = serde_json::from_value(serde_json::json!([
+            {"numberWithDialCode": "+386 •• ••• ••34", "lastTwoDigits": "34", "pushMode": "sms", "id": 2},
+            {"numberWithDialCode": "+1 (•••) •••-••12", "lastTwoDigits": "12", "pushMode": "sms", "id": 3},
+        ]))
+        .unwrap();
+        let texted = Some(icloud_auth::PhoneChoice { id: 3, reason: icloud_auth::PhoneReason::AppleDefault });
+        let prompt = TfaPrompt {
+            refused: 0, phones: &phones, texted, apple_default: Some(3), texts: 1, switch_refused: None,
+        };
+        let ids: Vec<u32> = other_phones(&prompt).map(|p| p.id).collect();
+        assert_eq!(ids, [2]);
+    }
+
+    /// Each switch is a text toward Apple's send limit, which then blocks a
+    /// fresh sign-in too, so the offer stops after MAX_PHONE_SWITCHES.
+    #[test]
+    fn other_phones_stops_after_max_phone_switches() {
+        let phones: Vec<TrustedPhoneNumber> = serde_json::from_value(serde_json::json!([
+            {"numberWithDialCode": "+386 •• ••• ••34", "lastTwoDigits": "34", "pushMode": "sms", "id": 2},
+            {"numberWithDialCode": "+1 (•••) •••-••12", "lastTwoDigits": "12", "pushMode": "sms", "id": 3},
+        ]))
+        .unwrap();
+        let texted = Some(icloud_auth::PhoneChoice { id: 3, reason: icloud_auth::PhoneReason::UserSwitch });
+        let after = |texts| TfaPrompt {
+            refused: 0, phones: &phones, texted, apple_default: None, texts, switch_refused: None,
+        };
+        // The first text plus MAX_PHONE_SWITCHES - 1 switches: one more allowed.
+        assert_eq!(other_phones(&after(MAX_PHONE_SWITCHES)).count(), 1);
+        assert_eq!(other_phones(&after(MAX_PHONE_SWITCHES + 1)).count(), 0);
+    }
+
     /// Only the sign-in identity changes: the service requests that follow keep
     /// FakeIOSConfig's iPhone identity and iosbuddy endpoint, as before 2026-10-13.
     #[test]
@@ -1061,7 +1213,9 @@ mod tests {
         // `LOGIN_UPSTREAM` is the load-bearing half — `contains(e)` alone holds
         // by construction of the arm and would still pass if the arm were
         // deleted into the generic bucket, which is the regression to catch.
-        let sms = E::SmsSendFailed { status: 423, message: "Too many codes sent.".into() };
+        // A refused SMS send at any status but 423 belongs here too: it may be
+        // Apple's endpoint failing rather than a limit, so it must keep alerting.
+        let sms = E::SmsSendFailed { status: 400, message: "Not allowed".into() };
         for e in [E::ExtraStep("repair".into()), E::FailedGetting2FAConfig, E::HardwareKeyError, sms] {
             let mapped = login_error(&e);
             assert_ne!(mapped.code(), "bad_credentials", "{e:?} must not blame the password");
@@ -1081,10 +1235,37 @@ mod tests {
             omnisette::AnisetteError::AnisetteNotProvisioned,
         );
         let mapped = login_error(&e);
-        assert_eq!(mapped.code(), "apple_error");
-        assert_ne!(mapped.code(), "bad_credentials");
+        // Its own code, so a client can tell "our host is down" from "Apple is
+        // refusing us" without parsing the sentence.
+        assert_eq!(mapped.code(), "anisette_unavailable");
         assert_ne!(mapped.to_string(), LOGIN_UPSTREAM, "anisette is not Apple's service");
         assert_eq!(mapped.to_string(), LOGIN_ANISETTE);
+    }
+
+    /// Apple's send limit is not an outage. Reported as `apple_error`, every
+    /// throttled number paged whoever runs the extractor for something only
+    /// time fixes, and the user's own retries — four in one minute in the
+    /// production log — were each refused the same way. The messages are the
+    /// two Apple actually sent, verbatim.
+    #[test]
+    fn login_error_reports_apples_sms_send_limit_as_its_own_code() {
+        use icloud_auth::Error as E;
+        for message in [
+            "This phone number cannot be used at this time. Try again later or choose a different number.",
+            "Enter the last code you received or try again later.",
+        ] {
+            let e = E::SmsSendFailed { status: 423, message: message.into() };
+            let mapped = login_error(&e);
+            assert_eq!(mapped.code(), "sms_refused", "{e:?}");
+            let detail = mapped.to_string();
+            // Apple's own reason survives — "choose a different number" is a
+            // way out we cannot offer ourselves.
+            assert!(detail.contains(message), "{detail}");
+            // The user is told to wait, and that retyping cannot help: the two
+            // things the old "Apple sign-in failed" wording did not say.
+            assert!(detail.contains("wait"), "{detail}");
+            assert!(detail.contains("not a problem with your Apple ID or password"), "{detail}");
+        }
     }
 
     /// The other half: a genuinely wrong password must still say so, or the fix
@@ -1105,6 +1286,7 @@ mod tests {
         assert!(mapped.to_string().contains("Enter the correct password"), "{mapped}");
 
         assert_eq!(login_error(&E::Bad2faCode).code(), "bad_credentials");
+        assert_eq!(login_error(&E::IncorrectCode).code(), "bad_credentials");
     }
 
     /// From 2026-10-13 00:40 UTC Apple answered every sign-in with -80045, and
@@ -1253,11 +1435,14 @@ mod tests {
         );
         assert_eq!(PipelineError::BadDeviceIndex("x".into()).code(), "bad_device_index");
         assert_eq!(PipelineError::NoBottles.code(), "no_bottles");
+        assert_eq!(PipelineError::SmsRefused("x".into()).code(), "sms_refused");
+        assert_eq!(PipelineError::AnisetteUnavailable.code(), "anisette_unavailable");
         assert_eq!(PipelineError::Apple("x".into()).code(), "apple_error");
         // A local input timeout is not Apple's fault.
         assert_eq!(PipelineError::Aborted.code(), "session_expired");
         // Display is never empty — it becomes the JSON `detail`.
         assert!(!PipelineError::NoBottles.to_string().is_empty());
+        assert!(!PipelineError::AnisetteUnavailable.to_string().is_empty());
         assert!(!PipelineError::Aborted.to_string().is_empty());
     }
 }
