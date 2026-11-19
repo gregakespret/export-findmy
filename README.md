@@ -214,7 +214,8 @@ with each phone as id and last two digits, and `reason` one of `apple_default`,
 blind), `apple_sent` (Apple texted the code itself) or `user_switch`.
 
 `signin_refused` (HTTP 502) is Apple turning the sign-in itself away with
--80045 "This action cannot be completed at this time." It can arrive before
+-80045 "This action cannot be completed at this time." or -22410 "This
+action could not be completed. Try again." It can arrive before
 Apple has checked the password, so it says nothing either way about the
 credentials. Since 2026-10-13 it is what Apple returns for the Android
 anisette every v3 server runs; a Mac's anisette, through

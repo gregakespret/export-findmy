@@ -104,7 +104,9 @@ pub enum PipelineError {
     /// has answered every sign-in from this tool this way, and AltServer,
     /// Sideloadly and xtool with it. Kept apart from `BadCredentials`, which
     /// is a 401 that client alerting reads as user error, so a refusal of
-    /// every sign-in read green for a day.
+    /// every sign-in read green for a day. Since 2026-11-18 Apple has done the
+    /// same with -22410 "This action could not be completed. Try again.", at
+    /// SRP init, for every Apple ID through the same Mac anisette.
     SigninRefused(String),
     /// Apple's -20209 "This Apple Account has been locked for security
     /// reasons": often its answer to a run of wrong passwords, but once it
@@ -339,11 +341,12 @@ fn with_next_step(err: PipelineError, next: &str) -> PipelineError {
 fn login_error(e: &icloud_auth::Error) -> PipelineError {
     use icloud_auth::Error as E;
     match e {
-        // The one `ec` that is not about the credentials: Apple refusing the
-        // sign-in outright, at either SRP round trip. Since the refusal can
-        // come before Apple checks the password, the detail says this is not
-        // Apple calling the password wrong, not that the password is right.
-        E::AuthSrpWithMessage(-80045, message) => PipelineError::SigninRefused(format!(
+        // The two `ec`s that are not about the credentials: Apple refusing the
+        // sign-in outright, at either SRP round trip (-22410 arrived at SRP
+        // init, before any password proof). Since the refusal can come before
+        // Apple checks the password, the detail says this is not Apple calling
+        // the password wrong, not that the password is right.
+        E::AuthSrpWithMessage(-80045 | -22410, message) => PipelineError::SigninRefused(format!(
             "Apple is refusing sign-ins from tools like this one right now. Apple \
              said: \"{message}\" This is not Apple saying your password is wrong, \
              so entering it again won't help. Please try again later."
@@ -1306,10 +1309,26 @@ mod tests {
         // way out is time.
         assert!(detail.contains("not Apple saying your password is wrong"), "{detail}");
         assert!(detail.contains("try again later"), "{detail}");
-        // Only -80045 moves: every other `ec` is still Apple's verdict on what
-        // was typed.
+        // Only -80045 and -22410 move: every other `ec` is still Apple's
+        // verdict on what was typed.
         let other = E::AuthSrpWithMessage(-20101, "Your Apple ID or password was incorrect.".into());
         assert_eq!(login_error(&other).code(), "bad_credentials");
+    }
+
+    /// From 2026-11-18 23:34 UTC every sign-in got -22410 at SRP init, four
+    /// Apple IDs in a row and no other answer. Apple refuses before any password
+    /// proof is sent, yet as `bad_credentials` each user was told to retype it,
+    /// and the outage read as user error. The message is verbatim from the
+    /// production log.
+    #[test]
+    fn login_error_reports_22410_as_apple_refusing_the_sign_in() {
+        use icloud_auth::Error as E;
+        let e = E::AuthSrpWithMessage(-22410, "This action could not be completed. Try again.".into());
+        let mapped = login_error(&e);
+        assert_eq!(mapped.code(), "signin_refused");
+        let detail = mapped.to_string();
+        assert!(detail.contains("This action could not be completed. Try again."), "{detail}");
+        assert!(detail.contains("not Apple saying your password is wrong"), "{detail}");
     }
 
     /// Between 2026-10-19 and 10-22 three sign-ins came back -20209, and as
