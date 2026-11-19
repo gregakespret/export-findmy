@@ -70,10 +70,11 @@ pub struct HeadersProvider {
 
 impl HeadersProvider {
     fn new(url: String) -> Self {
-        // The server returns only what the Mac's ADI computes. AOSKit's own
-        // local-user and device ids would identify the host Mac to every
-        // account signed in through it, so each run mints its own, derived the
-        // way the v3 provider derives them.
+        // Fallbacks for a headers server that serves no local-user or device
+        // id, derived the way the v3 provider derives them. Since 2026-11-18
+        // Apple refuses (-22410) a Mac sign-in whose X-Mme-Device-Id is not
+        // the one its anisette was provisioned for, so the server's own id,
+        // when it serves one, is kept over these (`or_insert_with` below).
         let id: [u8; 16] = rand::random();
         HeadersProvider {
             url,
@@ -145,8 +146,8 @@ mod tests {
         assert!(!logged.contains("s3cret"), "{logged}");
     }
 
-    /// Apple's sign-in requires the local-user and device ids, which a headers
-    /// server leaves out so as not to expose its host's.
+    /// Apple's sign-in requires the local-user and device ids; a headers
+    /// server from before 2026-11-18 serves neither.
     #[tokio::test]
     async fn headers_server_reply_gains_per_run_device_ids() {
         let url = serve_once(r#"{"X-Apple-I-MD":"otp","X-Apple-I-MD-M":"machine","X-Mme-Client-Info":"<Mac17,4> <macOS;26.5;25F71> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"}"#).await;
@@ -155,6 +156,16 @@ mod tests {
         assert_eq!(headers["X-Apple-I-MD-M"], "machine");
         assert_eq!(headers["X-Apple-I-MD-LU"].len(), 64);
         assert!(Uuid::parse_str(&headers["X-Mme-Device-Id"]).is_ok());
+    }
+
+    /// Since 2026-11-18 Apple refuses (-22410) a Mac sign-in whose device id is
+    /// not the anisette machine's own, so a served X-Mme-Device-Id must win
+    /// over the per-run fallback.
+    #[tokio::test]
+    async fn headers_server_device_id_is_kept() {
+        let url = serve_once(r#"{"X-Apple-I-MD":"otp","X-Apple-I-MD-M":"machine","X-Mme-Client-Info":"<Mac17,4> <macOS;26.5;25F71> <com.apple.AuthKit/1 (com.apple.akd/1.0)>","X-Mme-Device-Id":"237F0188-33A3-5DEA-B636-22FBEEF91C76"}"#).await;
+        let headers = HeadersProvider::new(url).get_anisette_headers().await.unwrap();
+        assert_eq!(headers["X-Mme-Device-Id"], "237F0188-33A3-5DEA-B636-22FBEEF91C76");
     }
 
     /// The sign-in claims the machine the server names, so a reply without
