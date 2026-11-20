@@ -10,13 +10,22 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use omnisette::remote_anisette_v3::RemoteAnisetteProviderV3;
 use omnisette::{AnisetteError, AnisetteProvider, LoginClientInfo};
+use reqwest::Url;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, PartialEq)]
+/// Where `--anisette-url` points when neither anisette flag is given.
+pub const DEFAULT_V3_URL: &str = "https://ani.sidestore.io";
+
+/// Above the Mac host's own 20 s limit on its helper, so a slow host still
+/// answers, and well inside the 180 s a caller waits for a session to start.
+const HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, PartialEq)]
 pub enum AnisetteServer {
     /// SideStore's v3 protocol: the server provisions Android ADI for us.
     V3(String),
@@ -24,29 +33,64 @@ pub enum AnisetteServer {
     Headers(String),
 }
 
-impl fmt::Display for AnisetteServer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::V3(url) => write!(f, "{url} (v3)"),
-            // A headers server is private and its path carries the access
-            // secret, so only its origin reaches the log.
-            Self::Headers(url) => {
-                let origin = url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
-                write!(f, "{origin}/… (headers)")
-            }
+impl AnisetteServer {
+    /// The server named by the `--anisette-url` and `--anisette-headers-url`
+    /// values. Checked at startup because a bad value otherwise boots a healthy
+    /// server that fails every connect. The errors never echo the URL, whose
+    /// path is a headers server's access secret.
+    pub fn from_flags(v3: Option<String>, headers: Option<String>) -> Result<Self, String> {
+        let (flag, url, server): (&str, String, fn(String) -> Self) = match (v3, headers) {
+            (Some(_), Some(_)) => return Err("pass --anisette-url or --anisette-headers-url, not both".into()),
+            (None, None) => return Ok(Self::V3(DEFAULT_V3_URL.into())),
+            (Some(url), None) => ("--anisette-url", url, Self::V3),
+            (None, Some(url)) => ("--anisette-headers-url", url, Self::Headers),
+        };
+        // Stored trimmed: the URL parser forgives surrounding whitespace (an env
+        // var that expanded with a trailing newline), but the v3 provider appends
+        // its path to the stored string with format!, and "https://host\n/v3/..."
+        // fails every connect, which is what this check exists to prevent.
+        let url = url.trim().to_owned();
+        if url.is_empty() {
+            return Err(format!("{flag} is empty"));
+        }
+        match Url::parse(&url) {
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") && parsed.has_host() => Ok(server(url)),
+            _ => Err(format!("{flag} is not an http(s) URL")),
         }
     }
 }
 
+impl fmt::Display for AnisetteServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::V3(url) => write!(f, "{url} (v3)"),
+            // A headers server is private and its URL carries the access
+            // secret, so only its origin reaches the log: no userinfo, path or
+            // query, any of which can hold the secret.
+            Self::Headers(url) => match Url::parse(url) {
+                Ok(parsed) => write!(f, "{}/… (headers)", parsed.origin().ascii_serialization()),
+                Err(_) => write!(f, "<invalid URL> (headers)"),
+            },
+        }
+    }
+}
+
+// Not derived: a derived Debug prints a headers URL whole, secret included.
+impl fmt::Debug for AnisetteServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 pub enum Provider {
-    V3(RemoteAnisetteProviderV3),
+    V3(Box<RemoteAnisetteProviderV3>),
     Headers(HeadersProvider),
 }
 
 impl Provider {
     pub fn new(server: &AnisetteServer, login_info: LoginClientInfo, state_dir: PathBuf) -> Self {
         match server {
-            AnisetteServer::V3(url) => Self::V3(RemoteAnisetteProviderV3::new(url.clone(), login_info, state_dir)),
+            AnisetteServer::V3(url) => Self::V3(Box::new(RemoteAnisetteProviderV3::new(url.clone(), login_info, state_dir))),
             AnisetteServer::Headers(url) => Self::Headers(HeadersProvider::new(url.clone())),
         }
     }
@@ -77,7 +121,10 @@ impl HeadersProvider {
         let id: [u8; 16] = rand::random();
         HeadersProvider {
             url,
-            http: reqwest::Client::new(),
+            // reqwest has no timeout by default, and this fetch reruns whenever
+            // AnisetteClient's 60 s cache lapses, mid-export included.
+            http: reqwest::Client::builder().timeout(HEADERS_TIMEOUT).build()
+                .expect("reqwest client builds, as in Client::new"),
             local_user: Sha256::digest(id).iter().map(|b| format!("{b:02x}")).collect(),
             device_id: Uuid::from_bytes(id).to_string(),
         }
@@ -132,6 +179,74 @@ mod tests {
     fn headers_server_secret_path_stays_out_of_the_log() {
         let shown = AnisetteServer::Headers("https://mac.example:8443/s3cret/".into()).to_string();
         assert_eq!(shown, "https://mac.example:8443/… (headers)");
+    }
+
+    /// The Mac host keeps its secret in the path, but a URL can carry one in its
+    /// userinfo or query just as well, and `{:?}` must hide it as `{}` does.
+    #[test]
+    fn headers_server_secret_outside_the_path_stays_out_of_the_log() {
+        for url in ["https://user:s3cret@mac.example/", "https://mac.example?token=s3cret"] {
+            let server = AnisetteServer::Headers(url.into());
+            let shown = format!("{server} {server:?}");
+            assert!(!shown.contains("s3cret"), "{shown}");
+            assert!(shown.contains("https://mac.example"), "{shown}");
+        }
+    }
+
+    /// A start command whose env var expanded to nothing, a URL without its
+    /// scheme, or both modes at once must stop the boot rather than boot a
+    /// server whose every connect fails. The refusal must not echo the URL.
+    #[test]
+    fn misconfigured_anisette_flags_are_refused_without_echoing_the_url() {
+        let headers = |url: &str| AnisetteServer::from_flags(None, Some(url.into()));
+        let v3 = |url: &str| AnisetteServer::from_flags(Some(url.into()), None);
+        let both = AnisetteServer::from_flags(Some("https://ani.example".into()), Some("https://mac.example/s3cret".into()));
+        // The reason names the flag, so the operator knows which value to fix.
+        for (result, reason) in [
+            (headers(""), "--anisette-headers-url is empty"),
+            (headers("  "), "--anisette-headers-url is empty"),
+            (headers("mac.example/s3cret"), "--anisette-headers-url is not an http(s) URL"),
+            (headers("ftp://mac.example/s3cret"), "--anisette-headers-url is not an http(s) URL"),
+            (v3("ani.example"), "--anisette-url is not an http(s) URL"),
+            (both, "not both"),
+        ] {
+            let error = result.unwrap_err();
+            assert!(error.contains(reason) && !error.contains("s3cret"), "{error}");
+        }
+    }
+
+    #[test]
+    fn anisette_flags_pick_their_mode() {
+        let mac = "https://mac.example/s3cret";
+        assert_eq!(AnisetteServer::from_flags(None, Some(mac.into())), Ok(AnisetteServer::Headers(mac.into())));
+        assert_eq!(AnisetteServer::from_flags(Some("http://localhost:6969".into()), None),
+                   Ok(AnisetteServer::V3("http://localhost:6969".into())));
+        assert_eq!(AnisetteServer::from_flags(None, None), Ok(AnisetteServer::V3(DEFAULT_V3_URL.into())));
+    }
+
+    /// An env var that expanded with a trailing newline still parses as a URL,
+    /// but the v3 provider appends "/v3/get_headers" to the stored string as is.
+    #[test]
+    fn anisette_flag_values_are_stored_trimmed() {
+        assert_eq!(AnisetteServer::from_flags(Some(" http://localhost:6969\n".into()), None),
+                   Ok(AnisetteServer::V3("http://localhost:6969".into())));
+    }
+
+    /// The Mac sleeps, or the tunnel takes the connection and never answers.
+    /// The fetch reruns whenever the 60 s header cache lapses, mid-export too,
+    /// so without a bound it holds the session until the export timeout.
+    #[tokio::test(start_paused = true)]
+    async fn headers_server_that_never_answers_fails_the_fetch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/s3cret/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut provider = HeadersProvider::new(url);
+        let fetch = provider.get_anisette_headers();
+        let outcome = tokio::time::timeout(Duration::from_secs(300), fetch).await;
+        assert!(matches!(outcome, Ok(Err(_))), "a silent server must fail the fetch, not hang it");
     }
 
     /// An unreachable host is the likeliest failure, and the pipeline logs the
