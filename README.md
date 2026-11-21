@@ -163,12 +163,15 @@ Each `beacon` returns the same key material as the plist output, base64-encoded
 `emoji`, `model`, and `pairing_date` (RFC3339). Errors are
 `{"error":"<code>","detail":"<message>"}` with codes `bad_credentials`
 (a wrong password *or* a wrong 2FA code — Apple judged what was typed and
-rejected it), `bad_2fa_code`, `unknown_phone`, `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
+rejected it; at sign-in only Apple's -22406 and -20101 mean that, and any
+other sign-in code is `apple_error`), `bad_2fa_code`, `unknown_phone`, `signin_refused`, `account_locked`, `bad_passcode`, `trust_circle_signature`, `device_no_shares`, `bad_device_index`,
 `no_bottles`, `wrong_step`, `session_not_found`, `session_expired`,
 `sms_refused`, `anisette_unavailable`, `extractor_panic`, `apple_error`.
 
 A sign-in that fails *without* Apple ever judging the credentials — a non-2xx
-from a GSA endpoint, an HTML error page where a plist was promised — is
+from a GSA endpoint, an HTML error page where a plist was promised, or a
+sign-in error code this tool does not know (`detail` carries Apple's text and
+the code) — is
 `apple_error` (HTTP 502), **not** `bad_credentials`. Three failures that used to
 share `apple_error` have their own code, also HTTP 502, because each needs
 different handling: `sms_refused` is Apple declining to text the 2FA code

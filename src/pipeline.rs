@@ -356,10 +356,13 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         E::AuthSrpWithMessage(-20209, _) => {
             PipelineError::AccountLocked(format!("Apple sign-in failed: {e}"))
         }
-        // Apple looked at the credentials and said no: `check_error` raises
+        // Apple looked at the password and said no: `check_error` raises
         // `AuthSrpWithMessage` on a 200 with `ec != 0`, carrying wording more
-        // specific than anything we would write (wrong password, expired
-        // code), so it is passed through.
+        // specific than anything we would write, so it is passed through. Only
+        // the two codes that are Apple's verdict on the password are listed —
+        // -22406 "Enter the correct password for this Apple Account." and
+        // -20101 "Your Apple ID or password was incorrect." — because this arm
+        // is a 401 the client files as the user's fault, which never alerts.
         //
         // `Bad2faCode` is the known soft spot in that rule. Its one raise site
         // is `if res.status() != 200` on `/auth/verify/phone/securitycode`, so
@@ -367,15 +370,24 @@ fn login_error(e: &icloud_auth::Error) -> PipelineError {
         // here because that endpoint answers a wrong code far more often than
         // it breaks, and the two are indistinguishable from this side; closing
         // it properly means splitting the status check upstream in rustpush.
-        // The trusted-device path is unaffected — `verify_2fa` goes through
-        // `check_error`, so a wrong code there arrives as `AuthSrpWithMessage`.
+        // The trusted-device path (`verify_2fa`, through `check_error`) is not
+        // reached from `login`, which texts a code instead, so a wrong code
+        // never arrives as `AuthSrpWithMessage`.
         //
         // `IncorrectCode` is the retypable kind of wrong code, which `login`
         // answers by asking for the code again; it reaches here only from a
         // direct `verify_sms_2fa` call, and means the same thing.
-        E::AuthSrpWithMessage(..) | E::Bad2faCode | E::IncorrectCode => {
+        E::AuthSrpWithMessage(-22406 | -20101, _) | E::Bad2faCode | E::IncorrectCode => {
             PipelineError::BadCredentials(format!("Apple sign-in failed: {e}"))
         }
+        // An `ec` this tool has not met. It used to fall into `bad_credentials`
+        // above, and that default is how -80045 (2026-10-13) and then -22410
+        // (2026-11-18) — Apple refusing every sign-in before any password proof
+        // — each read as a day of mistyped passwords with no alert. A code we
+        // cannot name is not a verdict on the password, so it goes where the
+        // client alerts; Apple's own text and code are passed through, which
+        // is also what names the next code to pin above.
+        E::AuthSrpWithMessage(..) => PipelineError::Apple(format!("Apple sign-in failed: {e}")),
         // The credentials are fine; the *account* is in a state that blocks
         // this login. Not `bad_credentials`: re-typing the password cannot fix
         // any of them. Each Display string is rustpush's own fixed text, not
@@ -1273,6 +1285,8 @@ mod tests {
 
     /// The other half: a genuinely wrong password must still say so, or the fix
     /// above has simply moved the confusion to the users who *did* mistype.
+    /// -22406 and -20101 are the two codes that mean exactly that, and the only
+    /// `ec`s that may land here now that an unknown one alerts instead.
     #[test]
     fn login_error_keeps_apples_own_verdict_on_the_credentials() {
         use icloud_auth::Error as E;
@@ -1287,6 +1301,11 @@ mod tests {
         assert_eq!(mapped.code(), "bad_credentials");
         assert!(mapped.to_string().contains("-22406"), "{mapped}");
         assert!(mapped.to_string().contains("Enter the correct password"), "{mapped}");
+
+        let incorrect = E::AuthSrpWithMessage(-20101, "Your Apple ID or password was incorrect.".into());
+        let mapped = login_error(&incorrect);
+        assert_eq!(mapped.code(), "bad_credentials");
+        assert!(mapped.to_string().contains("-20101"), "{mapped}");
 
         assert_eq!(login_error(&E::Bad2faCode).code(), "bad_credentials");
         assert_eq!(login_error(&E::IncorrectCode).code(), "bad_credentials");
@@ -1309,10 +1328,29 @@ mod tests {
         // way out is time.
         assert!(detail.contains("not Apple saying your password is wrong"), "{detail}");
         assert!(detail.contains("try again later"), "{detail}");
-        // Only -80045 and -22410 move: every other `ec` is still Apple's
-        // verdict on what was typed.
+        // -20101 is Apple's verdict on what was typed, so it stays a retype.
         let other = E::AuthSrpWithMessage(-20101, "Your Apple ID or password was incorrect.".into());
         assert_eq!(login_error(&other).code(), "bad_credentials");
+    }
+
+    /// -80045 and -22410 each hid for a day because the default for an `ec`
+    /// this tool had not seen was `bad_credentials`: a 401 the client counts as
+    /// user error and never alerts on. The next code Apple invents must alert
+    /// on first sight, and must not tell the user to retype a password Apple
+    /// may never have checked.
+    #[test]
+    fn login_error_alerts_on_an_srp_code_it_has_not_seen() {
+        use icloud_auth::Error as E;
+        let e = E::AuthSrpWithMessage(-99999, "Something went wrong. Try again later.".into());
+        let mapped = login_error(&e);
+        assert_ne!(mapped.code(), "bad_credentials", "{mapped}");
+        assert_eq!(mapped.code(), "apple_error");
+        // Apple's own words and the code reach the log and the user: they are
+        // what tells the next outage from the next typo, and name the code to
+        // pin once it is understood.
+        let detail = mapped.to_string();
+        assert!(detail.contains("Something went wrong. Try again later."), "{detail}");
+        assert!(detail.contains("-99999"), "{detail}");
     }
 
     /// From 2026-11-18 23:34 UTC every sign-in got -22410 at SRP init, four
